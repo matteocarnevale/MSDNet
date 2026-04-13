@@ -22,13 +22,14 @@ class Voxelizer(nn.Module):
     """Hard voxelization: assigns each point to a voxel by its (x,y,z) index."""
 
     def __init__(self, voxel_size, point_cloud_range,
-                 max_points_per_voxel=5, max_voxels=40000):
+                 max_points_per_voxel=5, max_voxels_train=40000, max_voxels_eval=60000):
         super().__init__()
         self.voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
         self.pc_range_min = torch.tensor(point_cloud_range[:3], dtype=torch.float32)
         self.pc_range_max = torch.tensor(point_cloud_range[3:], dtype=torch.float32)
         self.max_points = max_points_per_voxel
-        self.max_voxels = max_voxels
+        self.max_voxels_train = max_voxels_train
+        self.max_voxels_eval = max_voxels_eval
 
         grid = ((self.pc_range_max - self.pc_range_min) / self.voxel_size).long()
         self.register_buffer("grid_size", grid)
@@ -44,6 +45,9 @@ class Voxelizer(nn.Module):
             voxel_coords:   (total_voxels, 4)  batch_idx, z, y, x
             num_points:     (total_voxels,)
         """
+        # Use appropriate max_voxels based on training mode
+        max_voxels = self.max_voxels_train if self.training else self.max_voxels_eval
+        
         all_feats, all_coords, all_npts = [], [], []
         for batch_idx, points in enumerate(points_list):
             device = points.device
@@ -51,28 +55,80 @@ class Voxelizer(nn.Module):
             pc_min = self.pc_range_min.to(device)
             pc_max = self.pc_range_max.to(device)
 
+            # Filter points to point cloud range
             mask = ((points[:, :3] >= pc_min) & (points[:, :3] < pc_max)).all(dim=1)
             points = points[mask]
+            
+            if points.shape[0] == 0:
+                # Handle empty point cloud case
+                empty_feats = points.new_zeros(0, self.max_points, points.shape[1])
+                empty_coords = points.new_zeros(0, 4, dtype=torch.long)
+                empty_npts = points.new_zeros(0, dtype=torch.long)
+                all_feats.append(empty_feats)
+                all_coords.append(empty_coords)
+                all_npts.append(empty_npts)
+                continue
 
+            # Compute voxel coordinates
             coords = ((points[:, :3] - pc_min) / vs).long()
             gs = self.grid_size.to(device)
             coords = coords.clamp(min=torch.zeros(3, device=device, dtype=torch.long),
                                   max=gs - 1)
 
+            # Linear indexing for unique voxel detection
             linear = coords[:, 0] * (gs[1] * gs[2]) + coords[:, 1] * gs[2] + coords[:, 2]
 
             unique_linear, inverse = torch.unique(linear, return_inverse=True)
-            n_voxels = min(unique_linear.shape[0], self.max_voxels)
+            
+            # Apply voxel limit
+            n_unique_voxels = unique_linear.shape[0]
+            if n_unique_voxels > max_voxels:
+                if self.training:
+                    # Random sampling during training for regularization
+                    perm = torch.randperm(n_unique_voxels, device=device)[:max_voxels]
+                    selected_indices = perm
+                else:
+                    # Deterministic selection during evaluation (take first max_voxels)
+                    selected_indices = torch.arange(max_voxels, device=device)
+                
+                # Keep only points belonging to selected voxels
+                keep_mask = torch.zeros(len(inverse), dtype=torch.bool, device=device)
+                for i in selected_indices:
+                    keep_mask |= (inverse == i)
+                
+                points = points[keep_mask]
+                coords = coords[keep_mask]
+                inverse = inverse[keep_mask]
+                
+                # Remap inverse to 0-based consecutive indices
+                unique_old = torch.unique(inverse)
+                remap = torch.zeros(n_unique_voxels, dtype=torch.long, device=device)
+                remap[unique_old] = torch.arange(len(unique_old), device=device)
+                inverse = remap[inverse]
+                
+                n_voxels = len(unique_old)
+            else:
+                n_voxels = n_unique_voxels
 
             num_features = points.shape[1]
             voxel_feats = points.new_zeros(n_voxels, self.max_points, num_features)
             voxel_npts = points.new_zeros(n_voxels, dtype=torch.long)
             voxel_coords = points.new_zeros(n_voxels, 3, dtype=torch.long)
 
+            # Aggregate points into voxels
             for i in range(n_voxels):
                 pt_mask = inverse == i
+                if pt_mask.sum() == 0:
+                    continue
                 pts = points[pt_mask]
                 num_pts_in_voxel = min(pts.shape[0], self.max_points)
+                
+                # Random sampling of points within voxel during training
+                if self.training and pts.shape[0] > self.max_points:
+                    perm = torch.randperm(pts.shape[0], device=device)[:self.max_points]
+                    pts = pts[perm]
+                    num_pts_in_voxel = self.max_points
+                
                 voxel_feats[i, :num_pts_in_voxel] = pts[:num_pts_in_voxel]
                 voxel_npts[i] = num_pts_in_voxel
                 voxel_coords[i] = coords[pt_mask][0]
@@ -93,29 +149,101 @@ class Voxelizer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Voxel Feature Encoding (VFE) – simple mean-pooling + linear projection
+# Voxel Feature Encoding (VFE) – following VoxelNet paper (Zhou & Tuzel)
 # ---------------------------------------------------------------------------
 
-class VFE(nn.Module):
-    def __init__(self, in_features: int, out_channels: int):
+class VFELayer(nn.Module):
+    """Single VFE layer: PointNet-like per-point features + element-wise max pooling."""
+    
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_channels, bias=False)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        self.linear = nn.Linear(in_channels, out_channels, bias=False)
         self.norm = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, inputs: torch.Tensor, mask: torch.Tensor):
+        """
+        Args:
+            inputs: (V, T, C) voxel features
+            mask:   (V, T) point validity mask
+        Returns:
+            (V, out_channels) voxel-wise aggregated features
+        """
+        V, T, C = inputs.shape
+        # Flatten for linear layer: (V*T, C)
+        x = inputs.view(-1, C)
+        x = self.relu(self.norm(self.linear(x)))  # (V*T, out_channels)
+        x = x.view(V, T, -1)  # (V, T, out_channels)
+        
+        # Element-wise max pooling over valid points
+        x = x * mask.unsqueeze(-1).float()  # zero out invalid points
+        x_max, _ = torch.max(x, dim=1)  # (V, out_channels)
+        
+        return x_max
+
+
+class VFE(nn.Module):
+    """
+    VoxelNet-style Voxel Feature Encoding with stacked VFE layers.
+    
+    Architecture:
+        VFE-1: input_features -> vfe_channels[0]
+        VFE-2: vfe_channels[0] -> vfe_channels[1] 
+        ...
+        Final FC: vfe_channels[-1] -> out_channels
+    """
+    
+    def __init__(self, in_features: int, out_channels: int, 
+                 vfe_channels: tuple = (32,)):
+        super().__init__()
+        self.in_features = in_features
+        self.out_channels = out_channels
+        
+        # Build stacked VFE layers
+        layers = []
+        prev_channels = in_features
+        for channels in vfe_channels:
+            layers.append(VFELayer(prev_channels, channels))
+            prev_channels = channels
+            
+        self.vfe_layers = nn.ModuleList(layers)
+        
+        # Final projection to desired output channels
+        self.fc_out = nn.Sequential(
+            nn.Linear(prev_channels, out_channels, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, voxel_features, num_points):
         """
         Args:
-            voxel_features: (V, max_pts, F)
-            num_points:     (V,)
+            voxel_features: (V, max_pts, F) raw point features per voxel
+            num_points:     (V,) number of valid points per voxel
         Returns:
-            (V, out_channels)
+            (V, out_channels) voxel-wise encoded features
         """
-        mask = torch.arange(voxel_features.shape[1], device=voxel_features.device)
-        mask = mask.unsqueeze(0) < num_points.unsqueeze(1)
-        voxel_features = voxel_features * mask.unsqueeze(-1).float()
-        mean = voxel_features.sum(dim=1) / num_points.clamp(min=1).unsqueeze(-1).float()
-        out = self.linear(mean)
-        return self.norm(out)
+        V, T, F = voxel_features.shape
+        
+        # Create validity mask
+        mask = torch.arange(T, device=voxel_features.device).unsqueeze(0) < num_points.unsqueeze(1)
+        
+        # Process through VFE layers
+        x = voxel_features
+        for vfe_layer in self.vfe_layers:
+            x = vfe_layer(x, mask)  # (V, channels_i)
+            # Expand for next layer: (V, channels_i) -> (V, T, channels_i)
+            x = x.unsqueeze(1).expand(-1, T, -1)
+            
+        # Final aggregation (element-wise max over the last VFE output)
+        x = x * mask.unsqueeze(-1).float()
+        x_final, _ = torch.max(x, dim=1)  # (V, vfe_channels[-1])
+        
+        # Project to output channels
+        return self.fc_out(x_final)
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +339,12 @@ class VoxelEncoder(nn.Module):
             voxel_size, pc_range,
             voxel_cfg.max_points_per_voxel,
             voxel_cfg.max_voxels_train,
+            voxel_cfg.max_voxels_eval
         )
-        self.vfe = VFE(in_features, encoder_cfg.vfe_out_channels)
+        
+        # VFE with configurable intermediate channels
+        vfe_channels = getattr(encoder_cfg, 'vfe_channels', (32,))
+        self.vfe = VFE(in_features, encoder_cfg.vfe_out_channels, vfe_channels)
 
         sparse_shape = [grid_z, grid_y, grid_x]  # spconv uses (Z, Y, X)
         channels = encoder_cfg.sparse_channels

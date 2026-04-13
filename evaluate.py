@@ -139,15 +139,21 @@ def main():
     # Model
     if args.teacher_ckpt:
         teacher = MSDNetTeacher(cfg).to(device)
-        teacher.load_state_dict(
-            torch.load(args.teacher_ckpt, map_location=device))
+        teacher_ckpt = torch.load(args.teacher_ckpt, map_location=device)
+        if 'model_state_dict' in teacher_ckpt:
+            teacher.load_state_dict(teacher_ckpt['model_state_dict'])
+        else:
+            teacher.load_state_dict(teacher_ckpt)
         shared_recon = teacher.reconstruction
     else:
         shared_recon = None
 
     student = MSDNetStudent(cfg, shared_reconstruction=shared_recon).to(device)
-    student.load_state_dict(
-        torch.load(args.student_ckpt, map_location=device), strict=False)
+    student_ckpt = torch.load(args.student_ckpt, map_location=device)
+    if 'model_state_dict' in student_ckpt:
+        student.load_state_dict(student_ckpt['model_state_dict'], strict=False)
+    else:
+        student.load_state_dict(student_ckpt, strict=False)
     student.eval()
 
     # Evaluate

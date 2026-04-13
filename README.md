@@ -48,6 +48,16 @@ MSDNet/
 └── requirements.txt
 ```
 
+#### Key Improvements to the VoxelNet Implementation
+
+This implementation includes several enhancements over a basic VoxelNet:
+
+- **Multi-layer VFE**: Stacked VoxelNet Feature Encoding layers with element-wise max pooling (faithful to original Zhou & Tuzel paper)
+- **Smart Voxelization**: Separate `max_voxels_train` and `max_voxels_eval` limits with random sampling during training for better regularization
+- **Robust Point Sampling**: Random point selection within voxels during training to prevent overfitting to point ordering
+- **Enhanced Training**: Validation loops, checkpoint resuming, and best model saving
+- **Improved Configuration**: Configurable VFE channels and better hyperparameter organization
+
 ---
 
 ## 2. Requirements
@@ -131,6 +141,11 @@ python train_teacher.py \
     --log_dir    runs/teacher
 ```
 
+**Advanced Options:**
+- `--resume checkpoints/teacher/teacher_epoch40.pth` — Resume from checkpoint
+- `--val_interval 5` — Run validation every 5 epochs
+- `--save_interval 10` — Save checkpoint every 10 epochs
+
 | Argument | Default | Description |
 |---|---|---|
 | `--data_root` | *(required)* | Path to the VoD dataset root |
@@ -159,6 +174,12 @@ python train_student.py \
     --ckpt_dir     checkpoints/student \
     --log_dir      runs/student
 ```
+
+**Advanced Options:**
+- `--teacher_ckpt checkpoints/teacher/teacher_best.pth` — Use best teacher checkpoint
+- `--resume checkpoints/student/student_epoch50.pth` — Resume from checkpoint  
+- `--val_interval 5` — Run validation every 5 epochs
+- `--save_interval 10` — Save checkpoint every 10 epochs
 
 | Argument | Default | Description |
 |---|---|---|
