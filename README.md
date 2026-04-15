@@ -375,3 +375,43 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - VoxelNet authors for the foundational sparse 3D CNN architecture  
 - View-of-Delft dataset creators for the comprehensive 4D radar benchmark
 - spconv library maintainers for efficient sparse convolution implementations
+## Dataset Issues & Solutions
+
+### Problem: Training crashes with "FileNotFoundError" for .bin files
+
+If you see errors like:
+```
+FileNotFoundError: No such file or directory: '/path/radar/09646.bin'
+```
+
+**Solution 1 - Use permissive converter:**
+```bash
+# Convert with minimal filtering (preserves more files)
+python convert_vod_permissive.py \
+    --vod_root /path/to/view_of_delft_PUBLIC \
+    --output_dir data/vod \
+    --radar_type radar_5frames
+```
+
+**Solution 2 - Fix existing dataset:**
+```bash
+# Automatically fix splits based on existing files
+python fix_dataset.py --data_root /path/to/dataset
+
+# Or verify and fix manually
+python verify_dataset.py --data_root /path/to/dataset --fix_splits
+```
+
+**Solution 3 - Enable automatic file verification:**
+The dataset loader now automatically skips missing files during training (built-in robustness).
+
+### VoD Radar Variants
+
+Use the appropriate radar variant for your needs:
+
+| Variant | Density | Points/frame | Use case |
+|---------|---------|--------------|----------|
+| `radar` | Sparse | ~50-200 | Baseline experiments |
+| `radar_3frames` | Medium | ~150-600 | Ablation studies |
+| `radar_5frames` | Dense | ~250-1000 | **Main training** (best results) |
+

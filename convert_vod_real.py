@@ -19,21 +19,34 @@ from pathlib import Path
 from tqdm import tqdm
 
 
-def crop_points_to_range(points, point_cloud_range):
-    """Crop points to the specified range."""
+def crop_points_to_range(points, point_cloud_range, min_points=10):
+    """Crop points to the specified range, but keep files with minimum points."""
     pc_min = np.array(point_cloud_range[:3])
     pc_max = np.array(point_cloud_range[3:])
     mask = ((points[:, :3] >= pc_min) & (points[:, :3] < pc_max)).all(axis=1)
-    return points[mask]
+    cropped = points[mask]
+    
+    # If too few points after cropping, expand range slightly
+    if cropped.shape[0] < min_points and points.shape[0] > min_points:
+        # Try with expanded range (+20%)
+        pc_range_expanded = pc_max - pc_min
+        pc_min_exp = pc_min - 0.2 * pc_range_expanded
+        pc_max_exp = pc_max + 0.2 * pc_range_expanded
+        mask_exp = ((points[:, :3] >= pc_min_exp) & (points[:, :3] <= pc_max_exp)).all(axis=1)
+        expanded = points[mask_exp]
+        if expanded.shape[0] >= min_points:
+            return expanded
+    
+    return cropped
 
 
-def remove_ground_points(lidar_points, ground_height=-1.5):
-    """Remove ground points from LiDAR data."""
+def remove_ground_points(lidar_points, ground_height=-2.0):
+    """Remove ground points from LiDAR data - more permissive threshold."""
     return lidar_points[lidar_points[:, 2] > ground_height]
 
 
-def apply_fov_filter(points, fov_degrees=120.0):
-    """Apply horizontal field of view filter."""
+def apply_fov_filter(points, fov_degrees=140.0):
+    """Apply horizontal field of view filter - more permissive FOV."""
     angles = np.arctan2(points[:, 1], points[:, 0])
     half_fov = np.deg2rad(fov_degrees / 2)
     mask = np.abs(angles) <= half_fov
