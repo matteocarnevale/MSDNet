@@ -45,13 +45,12 @@ class VoDDataset(Dataset):
         with open(split_file, "r") as f:
             all_frame_ids = [line.strip() for line in f if line.strip()]
         
-        # Verify file existence if requested
+        # Verify file existence if requested (quiet mode)
         if verify_files:
-            print(f"Verifying {len(all_frame_ids)} frame IDs for {split} split...")
             valid_frame_ids = []
             missing_count = 0
             
-            for fid in tqdm(all_frame_ids, desc="Verifying files"):
+            for fid in all_frame_ids:
                 lidar_path = os.path.join(root, "lidar", f"{fid}.bin")
                 radar_path = os.path.join(root, "radar", f"{fid}.bin")
                 
@@ -62,7 +61,7 @@ class VoDDataset(Dataset):
             
             self.frame_ids = valid_frame_ids
             if missing_count > 0:
-                print(f"WARNING: {missing_count} frame IDs have missing files, using {len(self.frame_ids)} valid pairs")
+                print(f"Dataset: {len(self.frame_ids)} valid pairs ({missing_count} missing files)")
         else:
             self.frame_ids = all_frame_ids
 
@@ -167,7 +166,7 @@ class VoDDataset(Dataset):
                 z_dim = 20 * 2                   # 40
                 actual_voxel_size = base_vs * 1  # [0.1, 0.1, 0.15]
             
-            print(f"GT scale {scale}: dimensions ({z_dim}, {h_dim}, {w_dim}), voxel_size {actual_voxel_size}")
+# Debug print removed for clean training output
             
             # Create GT tensors matching model output dimensions EXACTLY
             occ = np.zeros((1, z_dim, h_dim, w_dim), dtype=np.float32)
