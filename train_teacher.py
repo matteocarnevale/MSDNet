@@ -6,8 +6,12 @@ Usage:
 
 import argparse
 import os
+import warnings
 
 import torch
+
+# Suppress spconv deprecation warnings (non-critical)
+warnings.filterwarnings("ignore", category=UserWarning, module="spconv")
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm

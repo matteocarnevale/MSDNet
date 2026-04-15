@@ -14,9 +14,13 @@ Usage:
 
 import argparse
 import time
+import warnings
 
 import numpy as np
 import torch
+
+# Suppress spconv deprecation warnings (non-critical)
+warnings.filterwarnings("ignore", category=UserWarning, module="spconv")
 from torch.utils.data import DataLoader
 from scipy.spatial import KDTree
 from tqdm import tqdm
