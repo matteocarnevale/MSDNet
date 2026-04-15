@@ -138,38 +138,51 @@ class VoDDataset(Dataset):
     # ---- ground-truth voxel targets (multi-scale) ----
 
     def _generate_gt(self, lidar: np.ndarray):
-        """Build occupancy and offset GT using SAME voxelization as model."""
-        # CRITICAL: Use identical parameters as VoxelEncoder
+        """Build occupancy and offset GT matching EXACT model upsampling logic."""
         pc_range = np.array(self.point_cloud_range)
         base_vs = np.array(self.voxel_size)
         pc_min = pc_range[:3]
-        pc_max = pc_range[3:]
         
         gt_occ, gt_offset = {}, {}
         
+        # CRITICAL: Follow model's progressive upsampling logic
+        # Model starts from BEV size and progressively upsamples
+        
         for scale in [4, 2, 1]:
-            # Use SAME logic as model voxelization
-            voxel_size = base_vs * scale
+            if scale == 4:
+                # Scale 1/4: Model uses BEV dimensions directly
+                # BEV is 40x40 after 8x downsample, Z is grid_z//4
+                h_dim, w_dim = 40, 40  # BEV size from config
+                z_dim = 40 // 4        # grid_z // 4 = 10
+                actual_voxel_size = base_vs * 4  # [0.4, 0.4, 0.6]
+                
+            elif scale == 2:
+                # Scale 1/2: 2x upsample from scale 4
+                h_dim, w_dim = 40 * 2, 40 * 2  # 80x80
+                z_dim = 10 * 2                  # 20
+                actual_voxel_size = base_vs * 2  # [0.2, 0.2, 0.3]
+                
+            else:  # scale == 1
+                # Scale 1: 2x upsample from scale 2  
+                h_dim, w_dim = 80 * 2, 80 * 2   # 160x160
+                z_dim = 20 * 2                   # 40
+                actual_voxel_size = base_vs * 1  # [0.1, 0.1, 0.15]
             
-            # Calculate grid dimensions EXACTLY like VoxelEncoder
-            grid_dims = ((pc_max - pc_min) / voxel_size).astype(int)  # Floor, not ceil!
-            gx, gy, gz = grid_dims[0], grid_dims[1], grid_dims[2]
+            print(f"GT scale {scale}: dimensions ({z_dim}, {h_dim}, {w_dim}), voxel_size {actual_voxel_size}")
             
-            print(f"GT scale {scale}: grid ({gx}, {gy}, {gz}), voxel_size {voxel_size}")
+            # Create GT tensors matching model output dimensions EXACTLY
+            occ = np.zeros((1, z_dim, h_dim, w_dim), dtype=np.float32)
+            offset = np.zeros((3, z_dim, h_dim, w_dim), dtype=np.float32)
             
-            # Create GT tensors with EXACT same dimensions as model output
-            occ = np.zeros((1, gz, gy, gx), dtype=np.float32)
-            offset = np.zeros((3, gz, gy, gx), dtype=np.float32)
-            
-            # Voxelize points using SAME method as Voxelizer class
-            coords = ((lidar[:, :3] - pc_min) / voxel_size).astype(int)
-            coords = np.clip(coords, 0, np.array([gx, gy, gz]) - 1)
+            # Voxelize points with the actual voxel size for this scale
+            coords = ((lidar[:, :3] - pc_min) / actual_voxel_size).astype(int)
+            coords = np.clip(coords, 0, np.array([w_dim, h_dim, z_dim]) - 1)
             
             for pt_idx in range(len(coords)):
                 xi, yi, zi = coords[pt_idx]
-                if 0 <= xi < gx and 0 <= yi < gy and 0 <= zi < gz:
+                if 0 <= xi < w_dim and 0 <= yi < h_dim and 0 <= zi < z_dim:
                     occ[0, zi, yi, xi] = 1.0
-                    center = pc_min + np.array([xi, yi, zi]) * voxel_size + voxel_size / 2
+                    center = pc_min + np.array([xi, yi, zi]) * actual_voxel_size + actual_voxel_size / 2
                     offset[:, zi, yi, xi] = lidar[pt_idx, :3] - center
 
             gt_occ[scale] = torch.from_numpy(occ)
