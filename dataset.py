@@ -32,7 +32,8 @@ class VoDDataset(Dataset):
                  point_cloud_range=None,
                  voxel_size=None,
                  ground_height: float = -1.5,
-                 radar_fov_deg: float = 120.0):
+                 radar_fov_deg: float = 120.0,
+                 verify_files: bool = True):
         super().__init__()
         self.root = root
         self.ground_height = ground_height
@@ -42,7 +43,28 @@ class VoDDataset(Dataset):
 
         split_file = os.path.join(root, "split", f"{split}.txt")
         with open(split_file, "r") as f:
-            self.frame_ids = [line.strip() for line in f if line.strip()]
+            all_frame_ids = [line.strip() for line in f if line.strip()]
+        
+        # Verify file existence if requested
+        if verify_files:
+            print(f"Verifying {len(all_frame_ids)} frame IDs for {split} split...")
+            valid_frame_ids = []
+            missing_count = 0
+            
+            for fid in tqdm(all_frame_ids, desc="Verifying files"):
+                lidar_path = os.path.join(root, "lidar", f"{fid}.bin")
+                radar_path = os.path.join(root, "radar", f"{fid}.bin")
+                
+                if os.path.exists(lidar_path) and os.path.exists(radar_path):
+                    valid_frame_ids.append(fid)
+                else:
+                    missing_count += 1
+            
+            self.frame_ids = valid_frame_ids
+            if missing_count > 0:
+                print(f"WARNING: {missing_count} frame IDs have missing files, using {len(self.frame_ids)} valid pairs")
+        else:
+            self.frame_ids = all_frame_ids
 
     def __len__(self):
         return len(self.frame_ids)
@@ -50,12 +72,17 @@ class VoDDataset(Dataset):
     def __getitem__(self, idx):
         fid = self.frame_ids[idx]
 
-        lidar = np.fromfile(
-            os.path.join(self.root, "lidar", f"{fid}.bin"), dtype=np.float32
-        ).reshape(-1, 4)
-        radar = np.fromfile(
-            os.path.join(self.root, "radar", f"{fid}.bin"), dtype=np.float32
-        ).reshape(-1, 5)
+        lidar_path = os.path.join(self.root, "lidar", f"{fid}.bin")
+        radar_path = os.path.join(self.root, "radar", f"{fid}.bin")
+        
+        # Check if files exist
+        if not os.path.exists(lidar_path):
+            raise FileNotFoundError(f"LiDAR file not found: {lidar_path}")
+        if not os.path.exists(radar_path):
+            raise FileNotFoundError(f"Radar file not found: {radar_path}")
+
+        lidar = np.fromfile(lidar_path, dtype=np.float32).reshape(-1, 4)
+        radar = np.fromfile(radar_path, dtype=np.float32).reshape(-1, 5)
 
         lidar = self._preprocess_lidar(lidar)
         radar = self._crop_to_range(radar)

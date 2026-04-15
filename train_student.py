@@ -58,6 +58,7 @@ def main():
         args.data_root, "train",
         point_cloud_range=cfg.voxel.point_cloud_range,
         voxel_size=cfg.voxel.voxel_size,
+        verify_files=True,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.training.batch_size,
@@ -82,6 +83,7 @@ def main():
             args.data_root, "test",
             point_cloud_range=cfg.voxel.point_cloud_range,
             voxel_size=cfg.voxel.voxel_size,
+            verify_files=True,
         )
         val_loader = DataLoader(
             val_ds, batch_size=cfg.training.batch_size,

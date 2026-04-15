@@ -133,24 +133,25 @@ pip install spconv-cu118  # CUDA 11.8
 View-of-Delft (VoD) Dataset - Primary evaluation dataset from the paper:
 
 ```bash
-# 1. Download VoD dataset
-# Follow official instructions to get view_of_delft_PUBLIC/
+# 1. Download VoD dataset to get view_of_delft_PUBLIC/
 
-# 2. Convert to MSDNet format (radar_5frames recommended for best performance)
+# 2. Convert to MSDNet format (radar_5frames recommended)
 python convert_vod_real.py \
     --vod_root /path/to/view_of_delft_PUBLIC \
     --output_dir data/vod \
     --radar_type radar_5frames
 
-# Expected structure:
-data/vod/
-├── lidar/          # (N, 4) float32 files: x, y, z, intensity
-├── radar/          # (N, 5) float32 files: x, y, z, intensity, velocity  
-└── split/
-    ├── train.txt   # Frame IDs for training
-    ├── test.txt    # Test sequences: 03, 04, 22 (paper Section IV-B)
-    └── val.txt     # Validation split
+# 3. Verify dataset consistency (IMPORTANT!)
+python verify_dataset.py --data_root data/vod --fix_splits
+
+# 4. Alternative: Fix splits automatically
+python fix_dataset.py --data_root data/vod
 ```
+
+**Radar Variants Available:**
+- `radar`: Single-frame (sparse, ~50-200 points)
+- `radar_3frames`: 3-frame accumulation (medium, ~150-600 points)  
+- `radar_5frames`: 5-frame accumulation (dense, ~250-1000 points) **[RECOMMENDED]**
 
 ### Stage 0: Teacher Training
 
