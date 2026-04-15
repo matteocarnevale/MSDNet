@@ -23,9 +23,8 @@ MSDNet/
 │   └── requirements.txt            # All dependencies with version constraints
 │
 ├── Data Pipeline  
-│   ├── dataset.py                  # VoD dataset loader with automatic preprocessing
-│   ├── convert_vod_real.py        # Real VoD dataset conversion script
-│   └── VoD_Dataset_Guide.md       # Comprehensive VoD dataset management guide
+│   ├── dataset.py                  # VoD dataset loader with built-in ground removal
+│   └── convert_vod.py             # VoD dataset converter (supports 3 radar variants)
 │
 ├── Model Architecture
 │   ├── models/
@@ -323,6 +322,15 @@ python train_teacher.py --batch_size 2
 | Dataset not found | Check path in `--data_root`, verify file structure |
 | Validation loss not improving | Check learning rate, try different teacher checkpoint |
 | Training too slow | Ensure GPU utilization with `nvidia-smi`, check data loading |
+
+### Pre-Training Verification
+
+**ALWAYS run before training:**
+```bash
+# Complete system verification
+python pre_training_test.py --data_root data/vod
+# Must show "SUCCESS: System ready for training!"
+```
 
 ### Development Tips
 
