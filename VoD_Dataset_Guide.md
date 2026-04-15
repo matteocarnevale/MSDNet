@@ -2,46 +2,46 @@
 
 This guide explains how to understand, process, and use the **actual VoD dataset structure** for MSDNet training.
 
-## 📁 Actual VoD Dataset Structure
+## ��� Actual VoD Dataset Structure
 
 Based on the provided dataset structure, VoD follows a **KITTI-style organization**:
 
 ```
 view_of_delft_PUBLIC/
-├── 📊 lidar/
-│   ├── ImageSets/                  # Pre-defined dataset splits
-│   │   ├── full.txt               # All frame IDs
-│   │   ├── train.txt              # Training frame IDs  
-│   │   ├── test.txt               # Test frame IDs
-│   │   ├── train_val.txt          # Training + validation IDs
-│   │   └── val.txt                # Validation frame IDs
-│   ├── testing/                   # Test set data
-│   └── training/                  # Training set data
-│       ├── calib/                 # Calibration files (*.txt)
-│       ├── image_2/               # Camera images (*.png)
-│       ├── label_2/               # 3D object labels (*.txt)  
-│       ├── pose/                  # Vehicle poses (*.txt)
-│       └── velodyne/              # LiDAR point clouds (*.bin)
-│
-├── 📡 radar/                      # Single-frame radar
-├── 📡 radar_3frames/              # 3-frame radar accumulation
-└── 📡 radar_5frames/              # 5-frame radar accumulation ⭐ RECOMMENDED
-    ├── ImageSets/                 # Same splits as LiDAR
-    ├── testing/
-    └── training/
-        ├── calib/                 # Radar-LiDAR calibration
-        ├── image_2/               # Synchronized camera images
-        ├── label_2/               # 3D object labels
-        ├── pose/                  # Vehicle poses
-        └── velodyne/              # 4D radar point clouds (*.bin)
+��── lidar/
+��   ├── ImageSets/                  # Pre-defined dataset splits
+��   │   ├── full.txt               # All frame IDs
+��   │   ├── train.txt              # Training frame IDs  
+��   │   ├── test.txt               # Test frame IDs
+��   │   ├── train_val.txt          # Training + validation IDs
+��   │   └── val.txt                # Validation frame IDs
+��   ├── testing/                   # Test set data
+��   └── training/                  # Training set data
+��       ├── calib/                 # Calibration files (*.txt)
+��       ├── image_2/               # Camera images (*.png)
+��       ├── label_2/               # 3D object labels (*.txt)  
+��       ├── pose/                  # Vehicle poses (*.txt)
+��       └── velodyne/              # LiDAR point clouds (*.bin)
+��
+��── radar/                         # Single-frame radar
+��── radar_3frames/                 # 3-frame radar accumulation
+��── radar_5frames/                 # 5-frame radar accumulation [RECOMMENDED]
+    ��── ImageSets/                 # Same splits as LiDAR
+    ��── testing/
+    ��── training/
+        ��── calib/                 # Radar-LiDAR calibration
+        ��── image_2/               # Synchronized camera images
+        ��── label_2/               # 3D object labels
+        ��── pose/                  # Vehicle poses
+        ��── velodyne/              # 4D radar point clouds (*.bin)
 ```
 
-## 🎯 Key Insights
+##  Key Insights
 
 ### 1. **Radar Variants**
 - **`radar/`**: Single-frame 4D radar (sparse)
 - **`radar_3frames/`**: 3-frame accumulation (denser)
-- **`radar_5frames/`**: 5-frame accumulation (densest) ⭐ **RECOMMENDED for MSDNet**
+- **`radar_5frames/`**: 5-frame accumulation (densest)  **RECOMMENDED for MSDNet**
 
 ### 2. **Data Synchronization**
 - All sensors are **temporally synchronized**
@@ -53,7 +53,7 @@ view_of_delft_PUBLIC/
 - **Use existing splits** to compare with literature
 - Paper uses sequences 03, 04, 22 for testing
 
-## 🔄 Data Format Details
+## ��� Data Format Details
 
 ### LiDAR Points (`lidar/training/velodyne/*.bin`)
 ```python
@@ -78,7 +78,7 @@ Tr_velo_to_cam: 7.533745e-03 -9.999714e-01 ... # LiDAR to camera transform
 Tr_imu_to_velo: 9.999976e-01 7.553071e-04 ... # IMU to LiDAR transform
 ```
 
-## 📊 Dataset Statistics
+##  Dataset Statistics
 
 | Split | Purpose | Recommended Use |
 |-------|---------|-----------------|
@@ -87,7 +87,7 @@ Tr_imu_to_velo: 9.999976e-01 7.553071e-04 ... # IMU to LiDAR transform
 | `val.txt` | Validation | Hyperparameter tuning |
 | `train_val.txt` | Train+Val | Extended training set |
 
-## 🛠️ Preprocessing Pipeline
+## ���️ Preprocessing Pipeline
 
 ### 1. **LiDAR Preprocessing** (Paper Section IV-B)
 ```python
@@ -128,7 +128,7 @@ def apply_calibration(points, calib_dict):
     return transformed_points
 ```
 
-## 🚀 Converting to MSDNet Format
+##  Converting to MSDNet Format
 
 Use the provided conversion script:
 
@@ -141,15 +141,15 @@ python convert_vod_real.py \
 
 # Output structure will be:
 data/vod/
-├── lidar/          # Processed LiDAR (N,4) float32
-├── radar/          # Processed radar (N,5) float32  
-└── split/
-    ├── train.txt
-    ├── test.txt
-    └── val.txt
+��── lidar/          # Processed LiDAR (N,4) float32
+��── radar/          # Processed radar (N,5) float32  
+��── split/
+    ��── train.txt
+    ��── test.txt
+    ��── val.txt
 ```
 
-## 📋 Verification Steps
+## ��� Verification Steps
 
 ### 1. **Check Data Integrity**
 ```python
@@ -184,7 +184,7 @@ def verify_conversion(data_dir):
     lidar_points = lidar_data.reshape(-1, 4)
     radar_points = radar_data.reshape(-1, 5)
     
-    print(f"✅ Frame {frame_id}:")
+    print(f" Frame {frame_id}:")
     print(f"  LiDAR: {lidar_points.shape[0]} points, shape {lidar_points.shape}")  
     print(f"  Radar: {radar_points.shape[0]} points, shape {radar_points.shape}")
 
@@ -223,7 +223,7 @@ def analyze_dataset(data_dir):
     print(f"Density ratio (LiDAR/Radar): {np.mean(lidar_counts)/np.mean(radar_counts):.1f}x")
 ```
 
-## 🎯 Training with Converted Data
+##  Training with Converted Data
 
 Once converted, use the standard MSDNet training pipeline:
 
@@ -247,7 +247,7 @@ python evaluate.py \
     --student_ckpt checkpoints/student/student_best.pth
 ```
 
-## ⚠️ Important Notes
+##  Important Notes
 
 1. **Radar Type**: Use `radar_5frames` for best performance (densest point clouds)
 2. **Calibration**: Ensure proper coordinate frame alignment between sensors
@@ -255,7 +255,7 @@ python evaluate.py \
 4. **Splits**: Use existing splits for fair comparison with literature  
 5. **Preprocessing**: Follow paper specifications exactly for reproducible results
 
-## 🎯 Expected Performance
+##  Expected Performance
 
 With proper VoD dataset processing, expect:
 - **Training time**: ~20-27 hours (RTX 4090)  

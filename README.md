@@ -5,30 +5,29 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-60%2F67%20Passing-brightgreen.svg)](#testing)
 
-**Production-ready PyTorch implementation** of MSDNet (Huang, Lu, Zheng et al., 2025), a knowledge distillation framework that transforms sparse 4D radar point clouds into dense, LiDAR-quality representations through progressive multi-stage distillation.
+Production-ready PyTorch implementation of MSDNet (Huang, Lu, Zheng et al., 2025), a knowledge distillation framework that transforms sparse 4D radar point clouds into dense, LiDAR-quality representations through progressive multi-stage distillation.
 
-## 🎯 Key Contributions
+## Key Contributions
 
-- **Enhanced VoxelNet Implementation**: Multi-layer VFE with element-wise max pooling faithful to the original paper
-- **Smart Voxelization**: Separate train/eval modes with random sampling for better regularization
-- **Advanced Training Pipeline**: Resume, validation, best model saving, TensorBoard integration
-- **Production-Ready**: 60/67 tests passing, comprehensive error handling, git versioned
+- Enhanced VoxelNet Implementation: Multi-layer VFE with element-wise max pooling faithful to the original paper
+- Smart Voxelization: Separate train/eval modes with random sampling for better regularization  
+- Advanced Training Pipeline: Resume, validation, best model saving, TensorBoard integration
+- Production-Ready: 60/67 tests passing, comprehensive error handling, git versioned
 
----
-
-## 📂 Project Structure
+## Project Structure
 
 ```
 MSDNet/
-├── 📋 Core Configuration
+├── Core Configuration
 │   ├── config.py                   # Complete hyperparameter configuration with paper-verified values
 │   └── requirements.txt            # All dependencies with version constraints
 │
-├── 🔬 Data Pipeline  
+├── Data Pipeline  
 │   ├── dataset.py                  # VoD dataset loader with automatic preprocessing
-│   └── convert_vod.py             # Utility script for VoD dataset conversion
+│   ├── convert_vod_real.py        # Real VoD dataset conversion script
+│   └── VoD_Dataset_Guide.md       # Comprehensive VoD dataset management guide
 │
-├── 🧠 Model Architecture
+├── Model Architecture
 │   ├── models/
 │   │   ├── __init__.py            # Model exports and imports
 │   │   ├── modules.py             # Reusable components (CBAM, ConvNeXt, DeformConv, etc.)
@@ -40,24 +39,22 @@ MSDNet/
 │   │   ├── reconstruction.py      # Progressive multi-scale point cloud reconstruction
 │   │   └── msdnet.py              # Complete MSDNetTeacher and MSDNetStudent models
 │   │
-├── 🎯 Training & Evaluation
+├── Training & Evaluation
 │   ├── losses.py                  # All loss functions (5 losses total, paper equations 5-15)
 │   ├── train_teacher.py           # Stage 0: Train LiDAR teacher with advanced features
 │   ├── train_student.py           # Stage 1+2: Train radar student with knowledge distillation
 │   └── evaluate.py                # Comprehensive evaluation with 5 metrics (CD, MHD, F-score, JSD, MMD)
 │
-└── 🧪 Testing & Documentation
+└── Testing & Documentation
     ├── test_smoke.py              # Comprehensive test suite (67 tests)
     └── README.md                  # This file
 ```
 
----
+## Architecture Deep Dive
 
-## 🏗️ Architecture Deep Dive
+### VoxelNet Encoder (models/encoder.py)
 
-### VoxelNet Encoder (`models/encoder.py`)
-
-**Enhanced implementation** with improvements over standard VoxelNet:
+Enhanced implementation with improvements over standard VoxelNet:
 
 ```python
 # Multi-layer VFE with element-wise max pooling (faithful to Zhou & Tuzel, CVPR 2018)
@@ -76,12 +73,12 @@ class Voxelizer(nn.Module):
     # Random point sampling within voxels to prevent overfitting
 ```
 
-**Pipeline**: `Points → Voxelization → VFE → Sparse3D CNN → BEV Features`
+Pipeline: Points → Voxelization → VFE → Sparse3D CNN → BEV Features
 
 ### Multi-Stage Distillation
 
-#### Stage 1: RGFD (`models/rgfd.py`)
-**Reconstruction-Guided Feature Distillation** - Aligns sparse radar features with dense LiDAR features:
+#### Stage 1: RGFD (models/rgfd.py)
+Reconstruction-Guided Feature Distillation - Aligns sparse radar features with dense LiDAR features:
 
 ```python
 class RGFD(nn.Module):
@@ -92,8 +89,8 @@ class RGFD(nn.Module):
     # Skip connections via Aggregation Module
 ```
 
-#### Stage 2: DGFD (`models/dgfd.py`) 
-**Diffusion-Guided Feature Distillation** - Treats Stage-1 output as noisy version of teacher:
+#### Stage 2: DGFD (models/dgfd.py) 
+Diffusion-Guided Feature Distillation - Treats Stage-1 output as noisy version of teacher:
 
 ```python
 class NoiseAdapter(nn.Module):
@@ -105,9 +102,9 @@ class LightweightDiffusionNet(nn.Module):
     # 10× faster than U-Net while maintaining accuracy
 ```
 
-### Point Cloud Reconstruction (`models/reconstruction.py`)
+### Point Cloud Reconstruction (models/reconstruction.py)
 
-**Progressive multi-scale reconstruction** at scales s ∈ {1/4, 1/2, 1}:
+Progressive multi-scale reconstruction at scales s ∈ {1/4, 1/2, 1}:
 
 ```python
 class PointCloudReconstruction(nn.Module):
@@ -116,9 +113,7 @@ class PointCloudReconstruction(nn.Module):
     # Offset: ΔP^(s) = tanh(φ_off(G^(s))) · L^(s)/2  (Equation 4)
 ```
 
----
-
-## 📊 Training Pipeline
+## Training Pipeline
 
 ### Prerequisites
 
@@ -135,14 +130,17 @@ pip install spconv-cu118  # CUDA 11.8
 
 ### Dataset Preparation
 
-**View-of-Delft (VoD) Dataset** - Primary evaluation dataset from the paper:
+View-of-Delft (VoD) Dataset - Primary evaluation dataset from the paper:
 
 ```bash
 # 1. Download VoD dataset
-git clone https://github.com/tudelft-iv/view-of-delft-dataset.git
+# Follow official instructions to get view_of_delft_PUBLIC/
 
-# 2. Convert to MSDNet format (adapt convert_vod.py to actual VoD structure)
-python convert_vod.py --vod_root /path/to/vod --output_dir data/vod
+# 2. Convert to MSDNet format (radar_5frames recommended for best performance)
+python convert_vod_real.py \
+    --vod_root /path/to/view_of_delft_PUBLIC \
+    --output_dir data/vod \
+    --radar_type radar_5frames
 
 # Expected structure:
 data/vod/
@@ -150,12 +148,13 @@ data/vod/
 ├── radar/          # (N, 5) float32 files: x, y, z, intensity, velocity  
 └── split/
     ├── train.txt   # Frame IDs for training
-    └── test.txt    # Test sequences: 03, 04, 22 (paper Section IV-B)
+    ├── test.txt    # Test sequences: 03, 04, 22 (paper Section IV-B)
+    └── val.txt     # Validation split
 ```
 
 ### Stage 0: Teacher Training
 
-**Train LiDAR-only teacher** (learns dense BEV representations):
+Train LiDAR-only teacher (learns dense BEV representations):
 
 ```bash
 # Basic training (60 epochs, ~8-12 hours on RTX 4090)
@@ -169,12 +168,12 @@ python train_teacher.py \
 python train_teacher.py \
     --data_root data/vod \
     --epochs 60 \
-    --val_interval 5 \       # Validate every 5 epochs
-    --save_interval 10 \     # Save checkpoint every 10 epochs  
-    --resume checkpoints/teacher/teacher_epoch30.pth  # Resume from epoch 30
+    --val_interval 5 \
+    --save_interval 10 \
+    --resume checkpoints/teacher/teacher_epoch30.pth
 ```
 
-**Teacher Loss** (Equation 7):
+Teacher Loss (Equation 7):
 ```
 L_teacher = Σ_s ρ^(s) L_occ^(s) + ζ^(s) L_off^(s)
 ρ = [1, 1, 1], ζ = [10, 10, 10] (paper values)
@@ -182,7 +181,7 @@ L_teacher = Σ_s ρ^(s) L_occ^(s) + ζ^(s) L_off^(s)
 
 ### Stage 1+2: Student Training  
 
-**Train radar student** with frozen teacher supervision:
+Train radar student with frozen teacher supervision:
 
 ```bash
 # Use best teacher checkpoint (90 epochs, ~12-15 hours)
@@ -194,7 +193,7 @@ python train_student.py \
     --save_interval 10
 ```
 
-**Student Loss** (Equation 15):
+Student Loss (Equation 15):
 ```
 L_student = λ₁L_recon + λ₂L_rec_distill + λ₃L_diff_distill + λ₄L_diff
 λ₁=1, λ₂=0.01, λ₃=5, λ₄=10 (paper values)
@@ -210,9 +209,7 @@ tensorboard --logdir runs/
 # Monitor: loss curves, validation metrics, learning rate schedule
 ```
 
----
-
-## 🎯 Evaluation & Results
+## Evaluation & Results
 
 ### Comprehensive Evaluation
 
@@ -227,11 +224,11 @@ python evaluate.py \
 
 | Metric | Description | Target (VoD) |
 |--------|-------------|--------------|
-| **CD** ↓ | Chamfer Distance (3D geometric accuracy) | 5.16 |
-| **MHD** ↓ | Modified Hausdorff Distance | 58.98×10⁻² |
-| **F-score** ↑ | Precision-Recall harmonic mean | 0.39 |
-| **JSD** ↓ | Jensen-Shannon Discrepancy (BEV consistency) | 0.21 |
-| **MMD** ↓ | Maximum Mean Discrepancy | 5.51×10⁻⁴ |
+| CD ↓ | Chamfer Distance (3D geometric accuracy) | 5.16 |
+| MHD ↓ | Modified Hausdorff Distance | 58.98×10⁻² |
+| F-score ↑ | Precision-Recall harmonic mean | 0.39 |
+| JSD ↓ | Jensen-Shannon Discrepancy (BEV consistency) | 0.21 |
+| MMD ↓ | Maximum Mean Discrepancy | 5.51×10⁻⁴ |
 
 ### Performance Benchmarks
 
@@ -240,11 +237,9 @@ python evaluate.py \
 | RTX 4090 | 8-12 hours | 12-15 hours | ~20-27 hours |
 | RTX 3080 | 12-16 hours | 18-22 hours | ~30-38 hours |
 
----
+## Testing
 
-## 🧪 Testing
-
-**Comprehensive test suite** ensuring production reliability:
+Comprehensive test suite ensuring production reliability:
 
 ```bash
 # Run all tests (60 pass, 7 skip without spconv)
@@ -252,19 +247,17 @@ conda activate msdnet
 python -m pytest test_smoke.py -v
 
 # Test categories:
-# ✅ Imports & Configuration (9 tests)
-# ✅ Dataset Loading & Preprocessing (6 tests)  
-# ✅ Model Components & Forward Pass (25 tests)
-# ✅ Loss Functions & Gradient Flow (17 tests)
-# ✅ Evaluation Metrics (8 tests)
-# ⚠️ Full Pipeline (7 tests - require spconv, skipped without GPU)
+# - Imports & Configuration (9 tests)
+# - Dataset Loading & Preprocessing (6 tests)  
+# - Model Components & Forward Pass (25 tests)
+# - Loss Functions & Gradient Flow (17 tests)
+# - Evaluation Metrics (8 tests)
+# - Full Pipeline (7 tests - require spconv, skipped without GPU)
 ```
 
----
+## Configuration Reference
 
-## ⚙️ Configuration Reference
-
-All hyperparameters verified against **paper Section IV-B**:
+All hyperparameters verified against paper Section IV-B:
 
 ```python
 # Voxelization (matches paper exactly)
@@ -293,9 +286,7 @@ alpha: 10, gamma: 20        # Feature distillation (non-empty/empty)
 lambda: [1, 0.01, 5, 10]   # Student loss combination
 ```
 
----
-
-## 🚀 Advanced Features
+## Advanced Features
 
 ### Resume Training
 ```bash
@@ -307,9 +298,9 @@ python train_student.py --resume checkpoints/student/student_epoch60.pth
 ```
 
 ### Validation & Best Model Selection
-- **Automatic validation** every N epochs (`--val_interval`)
-- **Best model saving** based on validation loss (`*_best.pth`)
-- **Periodic checkpoints** for safety (`--save_interval`)
+- Automatic validation every N epochs (`--val_interval`)
+- Best model saving based on validation loss (`*_best.pth`)
+- Periodic checkpoints for safety (`--save_interval`)
 
 ### Memory Optimization
 ```bash
@@ -320,36 +311,42 @@ python train_teacher.py --batch_size 2
 # torch.cuda.amp.autocast() and GradScaler()
 ```
 
----
-
-## 🔧 Troubleshooting
+## Troubleshooting
 
 ### Common Issues
 
 | Issue | Solution |
 |-------|----------|
-| **GPU OOM** | Reduce `--batch_size` to 2 or 1 |
-| **spconv import error** | Install correct CUDA version: `pip install spconv-cu121` |
-| **Dataset not found** | Check path in `--data_root`, verify file structure |
-| **Validation loss not improving** | Check learning rate, try different teacher checkpoint |
-| **Training too slow** | Ensure GPU utilization with `nvidia-smi`, check data loading |
+| GPU OOM | Reduce `--batch_size` to 2 or 1 |
+| spconv import error | Install correct CUDA version: `pip install spconv-cu121` |
+| Dataset not found | Check path in `--data_root`, verify file structure |
+| Validation loss not improving | Check learning rate, try different teacher checkpoint |
+| Training too slow | Ensure GPU utilization with `nvidia-smi`, check data loading |
 
 ### Development Tips
 
 ```bash
 # Quick syntax check without training
-python -c "from models import MSDNetTeacher, MSDNetStudent; print('✅ Models OK')"
+python -c "from models import MSDNetTeacher, MSDNetStudent; print('Models OK')"
 
 # Test data pipeline
-python -c "from dataset import VoDDataset; ds = VoDDataset('data/vod', 'train'); print(f'✅ Dataset: {len(ds)} samples')"
+python -c "from dataset import VoDDataset; ds = VoDDataset('data/vod', 'train'); print(f'Dataset: {len(ds)} samples')"
 
 # Monitor GPU usage
 watch -n 1 nvidia-smi
 ```
 
----
+## VoD Dataset Radar Variants
 
-## 📚 References & Citation
+The VoD dataset contains 3 radar variants:
+
+- **radar/**: Single-frame 4D radar (sparse, ~50-200 points)
+- **radar_3frames/**: 3-frame accumulation (denser, ~150-600 points)  
+- **radar_5frames/**: 5-frame accumulation (densest, ~250-1000 points) **RECOMMENDED**
+
+Use `radar_5frames` for best performance. Specify with `--radar_type radar_5frames` in conversion script.
+
+## References & Citation
 
 ```bibtex
 @article{huang2025msdnet,
@@ -367,29 +364,13 @@ watch -n 1 nvidia-smi
 }
 ```
 
----
-
-## 🤝 Contributing
-
-1. **Fork** the repository
-2. **Create** feature branch (`git checkout -b feature/amazing-feature`)
-3. **Add tests** for new functionality
-4. **Run** test suite (`python -m pytest test_smoke.py`)
-5. **Commit** changes (`git commit -m 'Add amazing feature'`)
-6. **Push** to branch (`git push origin feature/amazing-feature`)
-7. **Open** Pull Request
-
----
-
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
----
+## Acknowledgments
 
-## 🏆 Acknowledgments
-
-- **Original MSDNet authors** for the innovative multi-stage distillation approach
-- **VoxelNet authors** for the foundational sparse 3D CNN architecture  
-- **View-of-Delft dataset** creators for the comprehensive 4D radar benchmark
-- **spconv library** maintainers for efficient sparse convolution implementations
+- Original MSDNet authors for the innovative multi-stage distillation approach
+- VoxelNet authors for the foundational sparse 3D CNN architecture  
+- View-of-Delft dataset creators for the comprehensive 4D radar benchmark
+- spconv library maintainers for efficient sparse convolution implementations

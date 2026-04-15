@@ -1,11 +1,51 @@
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
 .pytest_cache/
-node_modules/
-.env
-dist/
-build/
-.DS_Store
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.cursor/
 .vscode/
-runs/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training artifacts
 checkpoints/
+runs/
+logs/
+
+# Data
+data/
+*.bin
+*.pcd
+*.las
+
+# Temporary files
+*.tmp
+*.temp
+*.zip
+*.tar.gz
+
+# External repositories (not needed)
+VoxelNet-PyTorch/
+Sparse2Dense/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
