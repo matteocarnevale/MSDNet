@@ -85,7 +85,7 @@ class VoDDataset(Dataset):
         radar = np.fromfile(radar_path, dtype=np.float32).reshape(-1, 5)
 
         lidar = self._preprocess_lidar(lidar)
-        radar = self._crop_to_range(radar)
+        # No preprocessing for radar (paper doesn't mention any)
 
         lidar_t = torch.from_numpy(lidar).float()
         radar_t = torch.from_numpy(radar).float()
@@ -103,10 +103,12 @@ class VoDDataset(Dataset):
     # ---- preprocessing ----
 
     def _preprocess_lidar(self, pc: np.ndarray) -> np.ndarray:
-        """Remove ground points and crop to radar FoV."""
+        """Remove ground points and crop to radar FoV (following paper Section IV-B)."""
+        # Paper: "removing ground points from the LiDAR data"
         pc = pc[pc[:, 2] > self.ground_height]
+        # Paper: "cropping the LiDAR point cloud to match the Field of View (FOV) of the 4D radar"
         pc = self._crop_to_fov(pc)
-        pc = self._crop_to_range(pc)
+        # Keep range cropping minimal - most filtering happens in model voxelization
         return pc
 
     def _crop_to_fov(self, pc: np.ndarray) -> np.ndarray:
@@ -128,28 +130,57 @@ class VoDDataset(Dataset):
     # ---- ground-truth voxel targets (multi-scale) ----
 
     def _generate_gt(self, lidar: np.ndarray):
-        """Build occupancy and offset GT at scales {1/4, 1/2, 1}."""
-        pc_range = self.point_cloud_range
+        """Build occupancy and offset GT at scales {1/4, 1/2, 1} matching model output."""
+        from config import MSDNetConfig
+        cfg = MSDNetConfig()
+        
+        # Use same grid calculation as the model
+        pc_range = np.array(self.point_cloud_range)
         base_vs = np.array(self.voxel_size)
-        pc_min = np.array(pc_range[:3])
-
+        pc_min = pc_range[:3]
+        
+        # Model dimensions: BEV is downsampled 8x from original grid
+        # Original grid: (320, 320, 40) -> BEV: (40, 40) -> Reconstruction uses this
+        original_grid = cfg.grid_size  # (320, 320, 40)
+        bev_size = cfg.bev_size        # (40, 40)
+        
         gt_occ, gt_offset = {}, {}
+        
         for scale in [4, 2, 1]:
+            # Model reconstruction logic: starts from BEV size and upsamples
+            if scale == 4:  # Scale 1/4
+                # Model: z_quarter = grid_z // 4, size = bev_size
+                z_dim = original_grid[2] // 4  # 40 // 4 = 10
+                y_dim, x_dim = bev_size        # (40, 40)
+            elif scale == 2:  # Scale 1/2  
+                # Model: upsample 2x from 1/4 scale
+                z_dim = original_grid[2] // 4 * 2  # 10 * 2 = 20
+                y_dim = bev_size[0] * 2             # 40 * 2 = 80
+                x_dim = bev_size[1] * 2             # 40 * 2 = 80
+            else:  # scale == 1 (full scale)
+                # Model: upsample 2x from 1/2 scale  
+                z_dim = original_grid[2] // 4 * 4   # 10 * 4 = 40
+                y_dim = bev_size[0] * 4             # 40 * 4 = 160
+                x_dim = bev_size[1] * 4             # 40 * 4 = 160
+            
+            print(f"GT scale {scale}: creating grid ({z_dim}, {y_dim}, {x_dim})")
+            
+            occ = np.zeros((1, z_dim, y_dim, x_dim), dtype=np.float32)
+            offset = np.zeros((3, z_dim, y_dim, x_dim), dtype=np.float32)
+            
+            # Calculate voxel size for this scale
             voxel_size = base_vs * scale
-            grid = np.ceil((np.array(pc_range[3:]) - pc_min) / voxel_size).astype(int)
-            gx, gy, gz = int(grid[0]), int(grid[1]), int(grid[2])
-
-            occ = np.zeros((1, gz, gy, gx), dtype=np.float32)
-            offset = np.zeros((3, gz, gy, gx), dtype=np.float32)
-
+            
+            # Voxelize points
             coords = ((lidar[:, :3] - pc_min) / voxel_size).astype(int)
-            coords = np.clip(coords, 0, np.array([gx, gy, gz]) - 1)
-
+            coords = np.clip(coords, 0, np.array([x_dim, y_dim, z_dim]) - 1)
+            
             for pt_idx in range(len(coords)):
                 xi, yi, zi = coords[pt_idx]
-                occ[0, zi, yi, xi] = 1.0
-                center = pc_min + np.array([xi, yi, zi]) * voxel_size + voxel_size / 2
-                offset[:, zi, yi, xi] = lidar[pt_idx, :3] - center
+                if 0 <= xi < x_dim and 0 <= yi < y_dim and 0 <= zi < z_dim:
+                    occ[0, zi, yi, xi] = 1.0
+                    center = pc_min + np.array([xi, yi, zi]) * voxel_size + voxel_size / 2
+                    offset[:, zi, yi, xi] = lidar[pt_idx, :3] - center
 
             gt_occ[scale] = torch.from_numpy(occ)
             gt_offset[scale] = torch.from_numpy(offset)
