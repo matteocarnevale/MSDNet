@@ -20,23 +20,31 @@ def debug_voxelnet_encoder(cfg):
     print("1. DEBUGGING VOXELNET ENCODER")
     print("-" * 40)
     
+    # Check CUDA availability
+    if not torch.cuda.is_available():
+        print("✗ CUDA not available - spconv requires GPU")
+        print("   Run debug on GPU or skip VoxelNet test")
+        return None, False
+    
+    device = torch.device('cuda')
+    
     try:
         encoder = VoxelEncoder(
             in_features=cfg.encoder.lidar_in_features,
             voxel_cfg=cfg.voxel,
             encoder_cfg=cfg.encoder
-        )
+        ).to(device)
         
-        # Create synthetic point clouds
+        # Create synthetic point clouds ON CUDA
         pc_range = cfg.voxel.point_cloud_range
         points1 = torch.from_numpy(
             np.random.uniform([pc_range[0], pc_range[1], pc_range[2], 0],
                             [pc_range[3], pc_range[4], pc_range[5], 1], (1000, 4))
-        ).float()
+        ).float().to(device)
         points2 = torch.from_numpy(
             np.random.uniform([pc_range[0], pc_range[1], pc_range[2], 0],
                             [pc_range[3], pc_range[4], pc_range[5], 1], (800, 4))
-        ).float()
+        ).float().to(device)
         
         points_list = [points1, points2]
         
