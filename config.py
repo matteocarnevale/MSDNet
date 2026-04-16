@@ -19,9 +19,8 @@ class VoxelConfig:
 class EncoderConfig:
     lidar_in_features: int = 4   # x, y, z, intensity
     radar_in_features: int = 5   # x, y, z, intensity, velocity
-    vfe_out_channels: int = 16
-    vfe_channels: tuple = (32,)  # Intermediate VFE layer channels
-    sparse_channels: List[int] = field(default_factory=lambda: [16, 32, 64, 128])
+    vfe_out_channels: int = 64   # Paper VFE output (after VFE-2)
+    sparse_channels: List[int] = field(default_factory=lambda: [64, 32, 64, 128])
     bev_channels: int = 128
 
 

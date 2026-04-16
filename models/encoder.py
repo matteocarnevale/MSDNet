@@ -349,9 +349,8 @@ class VoxelEncoder(nn.Module):
             voxel_cfg.max_voxels_eval
         )
         
-        # VFE with configurable intermediate channels
-        vfe_channels = getattr(encoder_cfg, 'vfe_channels', (32,))
-        self.vfe = VFE(in_features, encoder_cfg.vfe_out_channels, vfe_channels)
+        # Paper-faithful VFE (fixed architecture from paper)
+        self.vfe = VFE(in_features, encoder_cfg.vfe_out_channels)
 
         sparse_shape = [grid_z, grid_y, grid_x]  # spconv uses (Z, Y, X)
         channels = encoder_cfg.sparse_channels
