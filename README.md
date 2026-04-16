@@ -24,7 +24,7 @@ MSDNet/
 │
 ├── Data Pipeline  
 │   ├── dataset.py                  # VoD dataset loader with built-in ground removal
-│   └── convert_vod.py             # VoD dataset converter (supports 3 radar variants)
+│   └── convert_vod_fixed.py       # VoD converter with proper coordinate range clipping
 │
 ├── Model Architecture
 │   ├── models/

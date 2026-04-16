@@ -45,6 +45,14 @@ data/
 VoxelNet-PyTorch/
 Sparse2Dense/
 
+# Debug and temporary files
+debug_*.py
+analyze_*.py  
+profile_*.py
+test_*.py
+*_debug.py
+*_temp.py
+
 # Build artifacts
 build/
 dist/
