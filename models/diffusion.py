@@ -13,7 +13,7 @@ class DiffusionSchedule:
 
     def __init__(self, total_timesteps: int = 1000,
                  beta_start: float = 1e-4, beta_end: float = 0.02,
-                 device: torch.device = torch.device("cpu")):
+                 device: torch.device = torch.device("cuda")):
         self.T = total_timesteps
         betas = torch.linspace(beta_start, beta_end, total_timesteps,
                                dtype=torch.float64)
