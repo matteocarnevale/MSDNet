@@ -52,17 +52,21 @@ def main():
         cfg.training.batch_size = args.batch_size
     if args.lr:
         cfg.training.lr = args.lr
+    if args.ddim_backprop:
+        cfg.diffusion.ddim_backprop_in_training = True
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(args.log_dir)
 
+    vod_f = None if args.vod_sequence_filter == "none" else args.vod_sequence_filter
     # Data
     train_ds = VoDDataset(
         args.data_root, "train",
         point_cloud_range=cfg.voxel.point_cloud_range,
         voxel_size=cfg.voxel.voxel_size,
         verify_files=True,
+        vod_sequence_filter=vod_f,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.training.batch_size,
@@ -88,6 +92,7 @@ def main():
             point_cloud_range=cfg.voxel.point_cloud_range,
             voxel_size=cfg.voxel.voxel_size,
             verify_files=True,
+            vod_sequence_filter=vod_f,
         )
         val_loader = DataLoader(
             val_ds, batch_size=cfg.training.batch_size,

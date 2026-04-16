@@ -7,13 +7,60 @@ on-the-fly from the LiDAR point clouds via voxelization.
 Preprocessing follows R2LDM (Zheng et al., 2025):
     1. Remove ground points from LiDAR (simple height threshold).
     2. Crop LiDAR points to match the 4D radar FoV.
+
+Optional ``vod_sequence_filter="4drvo_net"``: MSDNet paper IV-A VoD split
+(sequences 03, 04, 22 in test). Frame ids should look like ``delft_03_...``.
 """
 
 import os
+import re
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from typing import List, Optional
+
+
+_VOD_4DRVO_TEST_SEQS = frozenset({"03", "04", "22"})
+
+
+def extract_vod_sequence_id(frame_id: str) -> Optional[str]:
+    """Two-digit sequence id from a VoD-style frame id, or None."""
+    fid = frame_id.replace("\\", "/")
+    m = re.search(r"delft_(\d+)_", fid, flags=re.I)
+    if m:
+        return f"{int(m.group(1)):02d}"
+    m = re.match(r"^(\d{2})_\d+", fid)
+    if m:
+        return m.group(1)
+    m = re.match(r"^(\d{2})\d{6,}$", fid)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _filter_frame_ids_4drvo_net(frame_ids: List[str], split: str) -> List[str]:
+    out = []
+    skipped = 0
+    for fid in frame_ids:
+        seq = extract_vod_sequence_id(fid)
+        if seq is None:
+            skipped += 1
+            continue
+        in_test = seq in _VOD_4DRVO_TEST_SEQS
+        if split == "train" and not in_test:
+            out.append(fid)
+        elif split == "test" and in_test:
+            out.append(fid)
+        elif split not in ("train", "test"):
+            if not in_test:
+                out.append(fid)
+    if skipped:
+        print(
+            f"Dataset 4drvo_net: skipped {skipped} ids (unparsable sequence; "
+            "expected e.g. delft_03_...)"
+        )
+    return out
 
 
 class VoDDataset(Dataset):
@@ -34,18 +81,32 @@ class VoDDataset(Dataset):
                  voxel_size=None,
                  ground_height: float = -1.5,
                  radar_fov_deg: float = 120.0,
-                 verify_files: bool = True):
+                 verify_files: bool = True,
+                 vod_sequence_filter: Optional[str] = None):
         super().__init__()
         self.root = root
         self.ground_height = ground_height
         self.radar_fov_deg = radar_fov_deg
         self.point_cloud_range = point_cloud_range or [0, -16, -2, 32, 16, 4]
         self.voxel_size = voxel_size or [0.1, 0.1, 0.15]
+        self.vod_sequence_filter = vod_sequence_filter
 
         split_file = os.path.join(root, "split", f"{split}.txt")
         with open(split_file, "r") as f:
             all_frame_ids = [line.strip() for line in f if line.strip()]
-        
+
+        if vod_sequence_filter == "4drvo_net":
+            n0 = len(all_frame_ids)
+            all_frame_ids = _filter_frame_ids_4drvo_net(all_frame_ids, split)
+            print(
+                f"Dataset 4drvo_net split={split!r}: {n0} -> {len(all_frame_ids)} frames"
+            )
+        elif vod_sequence_filter not in (None, ""):
+            raise ValueError(
+                f"Unknown vod_sequence_filter={vod_sequence_filter!r}; "
+                "use None or '4drvo_net'"
+            )
+
         # Verify file existence if requested (quiet mode)
         if verify_files:
             valid_frame_ids = []

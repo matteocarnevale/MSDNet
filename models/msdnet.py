@@ -135,13 +135,19 @@ class MSDNetStudent(nn.Module):
         f_sparse = self.encoder(radar_points, batch_size)
         f_recon = self.rgfd(f_sparse)
 
+        ddim_grad = (
+            training
+            and self.cfg.diffusion.ddim_backprop_in_training
+        )
+
         if training:
             assert f_teacher is not None, "Teacher features required during training"
 
-            # --- Student side: DGFD denoise ---
+            # --- Student side: DGFD denoise (Eq. 13; optional grad via config) ---
             f_denoised = self.dgfd.student_forward(
                 f_recon, self.start_timestep,
                 self.schedule, self.sampling_steps, self.sampling_interval,
+                ddim_requires_grad=ddim_grad,
             )
 
             # --- Teacher side: diffusion loss (Eq. 10) ---
@@ -164,6 +170,7 @@ class MSDNetStudent(nn.Module):
             f_denoised = self.dgfd.student_forward(
                 f_recon, self.start_timestep,
                 self.schedule, self.sampling_steps, self.sampling_interval,
+                ddim_requires_grad=False,
             )
             recon_out = self.reconstruction(f_denoised)
             return {
@@ -181,6 +188,7 @@ class MSDNetStudent(nn.Module):
         f_denoised = self.dgfd.student_forward(
             f_recon, self.start_timestep,
             self.schedule, self.sampling_steps, self.sampling_interval,
+            ddim_requires_grad=False,
         )
         return self.reconstruction.generate_point_cloud(
             f_denoised, threshold, point_cloud_range,

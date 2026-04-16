@@ -1,7 +1,7 @@
 """MSDNet configuration following the paper's implementation details."""
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -40,6 +40,8 @@ class DiffusionConfig:
     beta_start: float = 1e-4
     beta_end: float = 0.02
     time_embed_dim: int = 128
+    # Eq. 13: True = autograd through DDIM during student train (VRAM-heavy).
+    ddim_backprop_in_training: bool = False
 
 
 @dataclass
@@ -68,6 +70,8 @@ class TrainingConfig:
     student_epochs: int = 90
     num_workers: int = 4
     occupancy_threshold: float = 0.5
+    # None: use split/*.txt as-is. "4drvo_net": MSDNet paper IV-A VoD split.
+    vod_sequence_filter: Optional[str] = None
 
 
 @dataclass

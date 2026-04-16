@@ -120,6 +120,13 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--threshold", type=float, default=0.5,
                    help="Occupancy threshold for point generation")
+    p.add_argument(
+        "--vod_sequence_filter",
+        type=str,
+        default="none",
+        choices=("none", "4drvo_net"),
+        help="Paper IV-A VoD test split when using 4drvo_net.",
+    )
     return p.parse_args()
 
 
@@ -128,12 +135,14 @@ def main():
     cfg = MSDNetConfig()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    vod_f = None if args.vod_sequence_filter == "none" else args.vod_sequence_filter
     # Dataset
     test_ds = VoDDataset(
         args.data_root, "test",
         point_cloud_range=cfg.voxel.point_cloud_range,
         voxel_size=cfg.voxel.voxel_size,
         verify_files=True,
+        vod_sequence_filter=vod_f,
     )
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size,

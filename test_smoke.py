@@ -52,6 +52,7 @@ def small_cfg():
     cfg.diffusion.start_timestep = 5
     cfg.diffusion.sampling_steps = 5
     cfg.diffusion.sampling_interval = 1
+    cfg.diffusion.ddim_backprop_in_training = False
     cfg.training.batch_size = B
     return cfg
 
@@ -535,10 +536,14 @@ class TestLosses:
         grads = [p.grad for p in recon.parameters() if p.grad is not None]
         assert len(grads) > 0
 
-    def test_feature_distillation_loss(self, bev):
-        from losses import feature_distillation_loss
+    def test_feature_distillation_loss(self, bev, recon_gt):
+        from losses import bev_nonempty_mask_from_lidar_occ, feature_distillation_loss
 
-        loss = feature_distillation_loss(torch.randn_like(bev), bev)
+        occ, _ = recon_gt
+        mask = bev_nonempty_mask_from_lidar_occ(occ[1], bev.shape[-2:])
+        loss = feature_distillation_loss(
+            torch.randn_like(bev), bev, bev_nonempty_mask=mask,
+        )
         assert loss.dim() == 0 and loss.item() >= 0
 
     def test_diffusion_loss(self):

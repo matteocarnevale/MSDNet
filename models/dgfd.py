@@ -146,7 +146,8 @@ class DGFD(nn.Module):
 
     def student_forward(self, f_recon: torch.Tensor, timestep_m: int,
                         schedule, num_steps: int,
-                        interval: int) -> torch.Tensor:
+                        interval: int,
+                        ddim_requires_grad: bool = False) -> torch.Tensor:
         """
         Student-side: noise-adapt → DDIM denoise → denoised features F_r^D.
         """
@@ -161,5 +162,6 @@ class DGFD(nn.Module):
         f_denoised = schedule.ddim_sample(
             self.diffusion_net, f_noisy,
             start_t=timestep_m, interval=interval, num_steps=num_steps,
+            enable_grad=ddim_requires_grad,
         )
         return f_denoised

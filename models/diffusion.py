@@ -47,7 +47,10 @@ class DiffusionSchedule:
                   noise_pred: torch.Tensor) -> torch.Tensor:
         """One step of DDIM (eta=0, deterministic)."""
         ab_t = self.alpha_bar[t]
-        ab_prev = self.alpha_bar[t_prev] if t_prev >= 0 else torch.tensor(1.0)
+        if t_prev >= 0:
+            ab_prev = self.alpha_bar[t_prev]
+        else:
+            ab_prev = torch.tensor(1.0, device=x_t.device, dtype=ab_t.dtype)
 
         # predicted x_0
         x0_pred = (x_t - (1 - ab_t).sqrt() * noise_pred) / ab_t.sqrt()
@@ -56,30 +59,25 @@ class DiffusionSchedule:
         return ab_prev.sqrt() * x0_pred + dir_xt
 
     # ----- full reverse sampling loop (DDIM) -----
-    @torch.no_grad()
     def ddim_sample(self, model, x_start: torch.Tensor,
-                    start_t: int, interval: int, num_steps: int) -> torch.Tensor:
+                    start_t: int, interval: int, num_steps: int,
+                    enable_grad: bool = False) -> torch.Tensor:
         """
-        DDIM reverse sampling from timestep `start_t` down to 0.
+        DDIM reverse sampling from timestep `start_t` down to 0 (Eq. 13).
 
         Args:
-            model:    noise-prediction network  ε = model(x_t, t)
-            x_start:  noisy features at timestep start_t
-            start_t:  the initial timestep (e.g. m = 500)
-            interval: step size n  (e.g. 10)
-            num_steps: total sampling steps Tm (e.g. 50)
-        Returns:
-            denoised features
+            enable_grad: if True, run under torch.enable_grad() (training).
         """
         timesteps = list(range(start_t, start_t - interval * num_steps, -interval))
-        x_t = x_start
-
-        for i, t in enumerate(timesteps):
-            t_prev = t - interval if (i + 1) < num_steps else 0
-            t_tensor = torch.full((x_t.shape[0],), t,
-                                  device=x_t.device, dtype=torch.long)
-            noise_pred = model(x_t, t_tensor)
-            x_t = self.ddim_step(x_t, t, max(t_prev, 0), noise_pred)
+        ctx = torch.enable_grad if enable_grad else torch.no_grad
+        with ctx():
+            x_t = x_start
+            for i, t in enumerate(timesteps):
+                t_prev = t - interval if (i + 1) < num_steps else 0
+                t_tensor = torch.full((x_t.shape[0],), t,
+                                      device=x_t.device, dtype=torch.long)
+                noise_pred = model(x_t, t_tensor)
+                x_t = self.ddim_step(x_t, t, max(t_prev, 0), noise_pred)
 
         return x_t
 

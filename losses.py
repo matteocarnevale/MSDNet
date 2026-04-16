@@ -5,6 +5,8 @@ Student loss:   L_student = λ1 L_recon + λ2 L_rec_distill
                           + λ3 L_diff_distill + λ4 L_diff
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,28 +70,33 @@ def reconstruction_loss(recon_out: dict,
 # Feature distillation losses (Eqs. 8 and 14)
 # ---------------------------------------------------------------------------
 
+def bev_nonempty_mask_from_lidar_occ(gt_occ_fine: torch.Tensor,
+                                      bev_hw: tuple) -> torch.Tensor:
+    """
+    Ω_ne from LiDAR voxel occupancy at finest scale: any Z in column, pooled
+    to teacher BEV resolution (paper Eqs. 8, 14).
+    """
+    collapsed = gt_occ_fine.amax(dim=2)
+    pooled = F.adaptive_max_pool2d(collapsed, output_size=bev_hw)
+    return (pooled > 0.5).float()
+
+
 def feature_distillation_loss(f_student: torch.Tensor,
                               f_teacher: torch.Tensor,
                               alpha: float = 10.0,
-                              gamma: float = 20.0) -> torch.Tensor:
+                              gamma: float = 20.0,
+                              bev_nonempty_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Weighted MSE distillation loss with separate weights for non-empty
-    and empty BEV grid cells (Eqs. 8, 14).
-
-    Non-empty cells are those where the teacher feature has non-zero
-    activations (proxy for non-empty voxels after height compression).
-
-    Args:
-        f_student: (B, C, H, W) student features (F_r^R or F_r^D)
-        f_teacher: (B, C, H, W) dense LiDAR features F_l^D
-        alpha:     weight for non-empty cells
-        gamma:     weight for empty cells
+    Weighted MSE distillation (Eqs. 8, 14). If ``bev_nonempty_mask`` is set,
+    it defines Ω_ne from LiDAR occupancy; otherwise use teacher-norm heuristic.
     """
-    squared_error = (f_teacher - f_student).pow(2).mean(dim=1, keepdim=True)  # (B,1,H,W)
+    squared_error = (f_teacher.detach() - f_student).pow(2).mean(dim=1, keepdim=True)
 
-    # Heuristic: non-empty where teacher feature norm > 0
-    teacher_norm = f_teacher.detach().pow(2).sum(dim=1, keepdim=True)
-    non_empty = (teacher_norm > 0).float()
+    if bev_nonempty_mask is not None:
+        non_empty = bev_nonempty_mask
+    else:
+        teacher_norm = f_teacher.detach().pow(2).sum(dim=1, keepdim=True)
+        non_empty = (teacher_norm > 0).float()
     empty = 1.0 - non_empty
 
     num_nonempty = non_empty.sum().clamp(min=1)
@@ -165,11 +172,16 @@ class StudentLoss(nn.Module):
             student_out["recon_out"], gt_occ, gt_offset,
             self.rho, self.zeta,
         )
+        omega_ne = bev_nonempty_mask_from_lidar_occ(
+            gt_occ[1], f_teacher.shape[-2:],
+        )
         loss_rec_distill = feature_distillation_loss(
             student_out["f_recon"], f_teacher, self.alpha, self.gamma,
+            bev_nonempty_mask=omega_ne,
         )
         loss_diff_distill = feature_distillation_loss(
             student_out["f_denoised"], f_teacher, self.alpha, self.gamma,
+            bev_nonempty_mask=omega_ne,
         )
 
         eps_pred, eps_gt, _ = student_out["diff_loss_inputs"]

@@ -34,6 +34,13 @@ def parse_args():
     p.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     p.add_argument("--val_interval", type=int, default=10, help="Validation interval")
     p.add_argument("--save_interval", type=int, default=20, help="Checkpoint save interval")
+    p.add_argument(
+        "--vod_sequence_filter",
+        type=str,
+        default="none",
+        choices=("none", "4drvo_net"),
+        help="none: use split files. 4drvo_net: paper IV-A VoD split.",
+    )
     return p.parse_args()
 
 
@@ -51,12 +58,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(args.log_dir)
 
+    vod_f = None if args.vod_sequence_filter == "none" else args.vod_sequence_filter
     # Data
     train_ds = VoDDataset(
         args.data_root, "train",
         point_cloud_range=cfg.voxel.point_cloud_range,
         voxel_size=cfg.voxel.voxel_size,
         verify_files=True,  # Verify files exist and skip missing ones
+        vod_sequence_filter=vod_f,
     )
     train_loader = DataLoader(
         train_ds, batch_size=cfg.training.batch_size,
@@ -71,6 +80,7 @@ def main():
             point_cloud_range=cfg.voxel.point_cloud_range,
             voxel_size=cfg.voxel.voxel_size,
             verify_files=True,
+            vod_sequence_filter=vod_f,
         )
         val_loader = DataLoader(
             val_ds, batch_size=cfg.training.batch_size,
