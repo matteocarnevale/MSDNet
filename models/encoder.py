@@ -153,97 +153,104 @@ class Voxelizer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class VFELayer(nn.Module):
-    """Single VFE layer: PointNet-like per-point features + element-wise max pooling."""
+    """Paper-faithful VFE layer following Zhou & Tuzel CVPR 2018 exactly."""
     
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        
-        self.linear = nn.Linear(in_channels, out_channels, bias=False)
-        self.norm = nn.BatchNorm1d(out_channels)
+        # Paper: VFE-i(c_in, c_out) where linear maps c_in -> c_out//2
+        # because concatenation doubles to c_out
+        self.units = out_channels // 2
+        self.linear = nn.Linear(in_channels, self.units, bias=False)
+        self.norm = nn.BatchNorm1d(self.units)
         self.relu = nn.ReLU(inplace=True)
         
     def forward(self, inputs: torch.Tensor, mask: torch.Tensor):
         """
+        Paper-faithful VFE: FCN per point -> max -> concatenate [point_feat, max_feat]
+        
         Args:
-            inputs: (V, T, C) voxel features
+            inputs: (V, T, C) voxel features  
             mask:   (V, T) point validity mask
         Returns:
-            (V, out_channels) voxel-wise aggregated features
+            (V, T, 2*units) concatenated features (paper Eq. before Eq.1)
         """
         V, T, C = inputs.shape
-        # Flatten for linear layer: (V*T, C)
+        
+        # Apply FCN to each point: (V*T, C) -> (V*T, units)
         x = inputs.view(-1, C)
-        x = self.relu(self.norm(self.linear(x)))  # (V*T, out_channels)
-        x = x.view(V, T, -1)  # (V, T, out_channels)
+        x = self.relu(self.norm(self.linear(x)))
+        x = x.view(V, T, self.units)  # (V, T, units)
         
-        # Element-wise max pooling over valid points
-        x = x * mask.unsqueeze(-1).float()  # zero out invalid points
-        x_max, _ = torch.max(x, dim=1)  # (V, out_channels)
+        # Zero out invalid points
+        x = x * mask.unsqueeze(-1).float()
         
-        return x_max
+        # Element-wise max over points per voxel
+        x_max, _ = torch.max(x, dim=1, keepdim=True)  # (V, 1, units)
+        x_max = x_max.expand(-1, T, -1)               # (V, T, units)
+        
+        # Concatenate point features with max-pooled features (paper key step!)
+        x_concat = torch.cat([x, x_max], dim=-1)      # (V, T, 2*units)
+        
+        return x_concat
 
 
 class VFE(nn.Module):
-    """
-    VoxelNet-style Voxel Feature Encoding with stacked VFE layers.
+    """Paper-faithful VoxelNet VFE following Zhou & Tuzel exactly."""
     
-    Architecture:
-        VFE-1: input_features -> vfe_channels[0]
-        VFE-2: vfe_channels[0] -> vfe_channels[1] 
-        ...
-        Final FC: vfe_channels[-1] -> out_channels
-    """
-    
-    def __init__(self, in_features: int, out_channels: int, 
-                 vfe_channels: tuple = (32,)):
+    def __init__(self, in_features: int, out_channels: int):
         super().__init__()
-        self.in_features = in_features
-        self.out_channels = out_channels
+        # Paper config for LiDAR: VFE-1(7,32) + VFE-2(32,128) + final FCN
+        # We start with 4 features (x,y,z,intensity), add centroid offset -> 7
+        # Then VFE-1(7,32), VFE-2(32,64), final to out_channels
         
-        # Build stacked VFE layers
-        layers = []
-        prev_channels = in_features
-        for channels in vfe_channels:
-            layers.append(VFELayer(prev_channels, channels))
-            prev_channels = channels
-            
-        self.vfe_layers = nn.ModuleList(layers)
+        self.vfe1 = VFELayer(7, 32)        # First VFE: 7->16, concat->32
+        self.vfe2 = VFELayer(32, 64)       # Second VFE: 32->32, concat->64
         
-        # Final projection to desired output channels
-        self.fc_out = nn.Sequential(
-            nn.Linear(prev_channels, out_channels, bias=False),
-            nn.BatchNorm1d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-
+        # Final FCN + max pooling (no concatenation)
+        self.final_linear = nn.Linear(64, out_channels, bias=False)
+        self.final_norm = nn.BatchNorm1d(out_channels)
+        self.final_relu = nn.ReLU(inplace=True)
+        
     def forward(self, voxel_features, num_points):
         """
+        Paper-faithful forward with 7-D input and concatenation.
+        
         Args:
-            voxel_features: (V, max_pts, F) raw point features per voxel
+            voxel_features: (V, max_pts, 4) [x,y,z,intensity]
             num_points:     (V,) number of valid points per voxel
         Returns:
-            (V, out_channels) voxel-wise encoded features
+            (V, out_channels) voxel-wise features
         """
-        V, T, F = voxel_features.shape
+        V, T, _ = voxel_features.shape
         
-        # Create validity mask
+        # Paper step 1: Compute voxel centroids
         mask = torch.arange(T, device=voxel_features.device).unsqueeze(0) < num_points.unsqueeze(1)
         
-        # Process through VFE layers
-        x = voxel_features
-        for vfe_layer in self.vfe_layers:
-            x = vfe_layer(x, mask)  # (V, channels_i)
-            # Expand for next layer: (V, channels_i) -> (V, T, channels_i)
-            x = x.unsqueeze(1).expand(-1, T, -1)
-            
-        # Final aggregation (element-wise max over the last VFE output)
-        x = x * mask.unsqueeze(-1).float()
-        x_final, _ = torch.max(x, dim=1)  # (V, vfe_channels[-1])
+        # Compute centroids for each voxel
+        masked_features = voxel_features * mask.unsqueeze(-1).float()
+        centroids = masked_features.sum(dim=1) / num_points.clamp(min=1).unsqueeze(-1).float()  # (V, 4)
         
-        # Project to output channels
-        return self.fc_out(x_final)
+        # Paper step 2: Augment points with centroid offsets (7-D input)
+        centroids_expanded = centroids.unsqueeze(1).expand(-1, T, -1)  # (V, T, 4)
+        centroid_offsets = voxel_features[:, :, :3] - centroids_expanded[:, :, :3]  # (V, T, 3)
+        
+        # Create 7-D input: [x, y, z, intensity, x-vx, y-vy, z-vz]
+        inputs_7d = torch.cat([
+            voxel_features,           # (V, T, 4) - x,y,z,intensity
+            centroid_offsets         # (V, T, 3) - centroid offsets
+        ], dim=-1)                   # (V, T, 7)
+        
+        # Paper VFE layers with concatenation
+        x = self.vfe1(inputs_7d, mask)    # (V, T, 32)
+        x = self.vfe2(x, mask)            # (V, T, 64)
+        
+        # Final aggregation (max pooling, no concatenation)
+        x = x * mask.unsqueeze(-1).float()
+        x_final, _ = torch.max(x, dim=1)  # (V, 64)
+        
+        # Final FCN
+        x_out = self.final_relu(self.final_norm(self.final_linear(x_final)))
+        return x_out
 
 
 # ---------------------------------------------------------------------------
