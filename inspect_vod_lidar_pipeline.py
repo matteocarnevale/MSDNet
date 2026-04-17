@@ -1,7 +1,7 @@
 """Ispezione visiva della pipeline LiDAR VoD: dal .bin grezzo al tensore usato dal dataset.
 
-Usa gli stessi metodi di ``dataset.VoDDataset`` (ground removal → FoV → range) così puoi
-vedere dove cambiano forma e densità della nuvola e se qualcosa non torna rispetto al VoD.
+Usa gli stessi metodi di ``dataset.VoDDataset`` (ground removal → FoV → range) e salva una
+figura **3D** (scatter x,y,z) per ogni stadio, con wireframe del ``point_cloud_range``.
 
 Usage:
     python inspect_vod_lidar_pipeline.py --data_root /path/to/vod
@@ -19,6 +19,7 @@ import numpy as np
 
 from config import MSDNetConfig
 from dataset import VoDDataset
+from plot_vod_raw_lidar import _draw_range_box_3d, _set_3d_equal_aspect
 
 
 def load_lidar_bin(path: str) -> np.ndarray:
@@ -68,7 +69,7 @@ def n_pts(pc: np.ndarray) -> int:
     return int(pc.shape[0]) if pc is not None else 0
 
 
-def plot_stages_bev(
+def plot_stages_3d(
     stages: Dict[str, np.ndarray],
     out_png: str,
     frame_label: str,
@@ -76,7 +77,7 @@ def plot_stages_bev(
     max_pts: int,
     point_cloud_range: list,
 ) -> None:
-    """Figura 1×4: BEV (x,y) colorata per z; rettangolo rosso = ``point_cloud_range`` in x,y."""
+    """Figura 1×4: scatter 3D (x,y,z) colorato per z; wireframe rosso = ``point_cloud_range``."""
     try:
         import matplotlib
 
@@ -93,37 +94,37 @@ def plot_stages_bev(
         "after_range": "Dopo crop range (dataset)",
     }
     n = len(order)
-    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4.5), squeeze=False)
-    pc_min = np.array(point_cloud_range[:3])
-    pc_max = np.array(point_cloud_range[3:])
-    for ax, key in zip(axes[0], order):
+    fig = plt.figure(figsize=(4.2 * n, 4.8))
+    views = [(22, -65), (18, 25), (12, 110), (8, -120)]
+    for i, key in enumerate(order):
+        ax = fig.add_subplot(1, n, i + 1, projection="3d")
         pc = stages.get(key)
         if pc is None or pc.shape[0] == 0:
             ax.set_title(f"{title_map[key]}\n0 punti")
-            ax.text(0.5, 0.5, "vuoto", ha="center", va="center", transform=ax.transAxes)
             continue
         s = _subsample(pc, max_pts)
+        xyz = s[:, :3]
         sc = ax.scatter(
-            s[:, 0],
-            s[:, 1],
-            c=s[:, 2],
+            xyz[:, 0],
+            xyz[:, 1],
+            xyz[:, 2],
+            c=xyz[:, 2],
             cmap="viridis",
-            s=0.15,
-            alpha=0.45,
+            s=0.2,
+            alpha=0.5,
+            depthshade=False,
             rasterized=True,
         )
-        plt.colorbar(sc, ax=ax, fraction=0.046, label="z")
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x [m]")
-        ax.set_ylabel("y [m]")
-        ax.grid(True, alpha=0.3)
-        # Box range addestramento
-        ax.axhline(pc_min[1], color="red", lw=0.6, alpha=0.5)
-        ax.axhline(pc_max[1], color="red", lw=0.6, alpha=0.5)
-        ax.axvline(pc_min[0], color="red", lw=0.6, alpha=0.5)
-        ax.axvline(pc_max[0], color="red", lw=0.6, alpha=0.5)
+        elev, azim = views[i % len(views)]
+        ax.view_init(elev=elev, azim=azim)
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
+        _set_3d_equal_aspect(ax, xyz)
+        _draw_range_box_3d(ax, point_cloud_range)
+        plt.colorbar(sc, ax=ax, fraction=0.04, shrink=0.7, label="z [m]")
         ax.set_title(f"{title_map[key]}\n{n_pts(pc)} pt (plot {s.shape[0]})")
-    fig.suptitle(f"VoD LiDAR — BEV\n{frame_label}", fontsize=11)
+    fig.suptitle(f"VoD LiDAR — 3D\n{frame_label}", fontsize=11)
     fig.tight_layout()
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
@@ -196,7 +197,7 @@ def main():
     stages = lidar_preprocessing_stages(ds, raw)
     os.makedirs(args.out_dir, exist_ok=True)
     safe = frame_id.replace("/", "_").replace("\\", "_")
-    out_png = os.path.join(args.out_dir, f"vod_lidar_bev_{safe}.png")
+    out_png = os.path.join(args.out_dir, f"vod_lidar_3d_{safe}.png")
     summary_path = os.path.join(args.out_dir, f"vod_lidar_{safe}_stats.txt")
 
     print(f"File: {lidar_path}")
@@ -207,7 +208,7 @@ def main():
     for k in ["raw", "after_ground", "after_fov", "after_range"]:
         print_stats(k, stages[k])
 
-    plot_stages_bev(
+    plot_stages_3d(
         stages,
         out_png,
         frame_label=f"{frame_id}\n{lidar_path}",
@@ -232,7 +233,7 @@ def main():
                     f"  z min/max: {xyz[:,2].min():.4f} / {xyz[:,2].max():.4f}\n"
                 )
 
-    print(f"\nFigura BEV salvata: {out_png}")
+    print(f"\nFigura 3D salvata: {out_png}")
     print(f"Statistiche: {summary_path}")
 
 

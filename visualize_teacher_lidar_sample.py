@@ -24,6 +24,7 @@ import torch
 from config import MSDNetConfig
 from dataset import VoDDataset
 from models.msdnet import MSDNetTeacher
+from plot_vod_raw_lidar import _draw_range_box_3d, _set_3d_equal_aspect
 
 
 def _set_seed(seed: int) -> None:
@@ -123,8 +124,7 @@ def main():
     off1 = recon_out["offset_1"]
     pred_pts = _decode_points_from_finest(occ1, off1, pc_min, vs, occ_thresh=args.occ_thresh)
 
-    bev = f_dense[0].mean(dim=0).float().cpu().numpy()
-    occ_max_z = torch.sigmoid(occ1[0, 0]).max(dim=0).values.cpu().numpy()
+    box6 = list(cfg.voxel.point_cloud_range)
 
     os.makedirs(args.out_dir, exist_ok=True)
     base = os.path.join(args.out_dir, f"teacher_viz_{frame_id.replace('/', '_')}")
@@ -143,46 +143,74 @@ def main():
     if n_pts > 0:
         step = max(1, n_pts // 50000)
         sl = slice(None, None, step)
+        xyz_in = lidar_np[sl, :3]
         ax1.scatter(
-            lidar_np[sl, 0],
-            lidar_np[sl, 1],
-            lidar_np[sl, 2],
+            xyz_in[:, 0],
+            xyz_in[:, 1],
+            xyz_in[:, 2],
             c=lidar_np[sl, 3],
             cmap="viridis",
-            s=0.3,
+            s=0.35,
             alpha=0.6,
+            depthshade=False,
         )
+        _set_3d_equal_aspect(ax1, xyz_in)
+        _draw_range_box_3d(ax1, box6)
     ax1.set_title(f"Input LiDAR (preprocess)\n{frame_id}  ({n_pts} pt)")
     ax1.set_xlabel("x")
     ax1.set_ylabel("y")
     ax1.set_zlabel("z")
+    ax1.view_init(elev=20, azim=-60)
 
-    ax2 = fig.add_subplot(2, 2, 2)
-    im = ax2.imshow(bev, origin="lower", aspect="auto", cmap="magma")
-    ax2.set_title(f"BEV F_l^D — mean sui canali\n{weights_tag}")
-    plt.colorbar(im, ax=ax2, fraction=0.046)
+    ax2 = fig.add_subplot(2, 2, 2, projection="3d")
+    if n_pts > 0:
+        step = max(1, n_pts // 50000)
+        sl = slice(None, None, step)
+        xyz2 = lidar_np[sl, :3]
+        ax2.scatter(
+            xyz2[:, 0],
+            xyz2[:, 1],
+            xyz2[:, 2],
+            c=lidar_np[sl, 3],
+            cmap="viridis",
+            s=0.35,
+            alpha=0.6,
+            depthshade=False,
+        )
+        _set_3d_equal_aspect(ax2, xyz2)
+        _draw_range_box_3d(ax2, box6)
+    ax2.set_title(f"Input LiDAR — altra vista\n{weights_tag}")
+    ax2.set_xlabel("x")
+    ax2.set_ylabel("y")
+    ax2.set_zlabel("z")
+    ax2.view_init(elev=8, azim=85)
 
-    ax3 = fig.add_subplot(2, 2, 3)
-    im3 = ax3.imshow(occ_max_z, origin="lower", aspect="auto", vmin=0, vmax=1, cmap="hot")
-    ax3.set_title("max_z sigmoid(occ_1) — scala 1")
-    plt.colorbar(im3, ax=ax3, fraction=0.046)
-
-    ax4 = fig.add_subplot(2, 2, 4, projection="3d")
+    ax3 = fig.add_subplot(2, 2, 3, projection="3d")
     npred = pred_pts.shape[0]
     if npred > 0:
         st = max(1, npred // 50000)
-        ax4.scatter(
-            pred_pts[::st, 0],
-            pred_pts[::st, 1],
-            pred_pts[::st, 2],
-            s=0.4,
-            c="coral",
-            alpha=0.5,
-        )
-    ax4.set_title(f"Ricostruzione da occ/offset (soglia {args.occ_thresh})\n{npred} punti")
+        pr = pred_pts[::st]
+        ax3.scatter(pr[:, 0], pr[:, 1], pr[:, 2], s=0.45, c="coral", alpha=0.55, depthshade=False)
+        _set_3d_equal_aspect(ax3, pr)
+        _draw_range_box_3d(ax3, box6)
+    ax3.set_title(f"Ricostruzione occ/offset (τ={args.occ_thresh})\n{npred} pt")
+    ax3.set_xlabel("x")
+    ax3.set_ylabel("y")
+    ax3.set_zlabel("z")
+    ax3.view_init(elev=22, azim=-65)
+
+    ax4 = fig.add_subplot(2, 2, 4, projection="3d")
+    if npred > 0:
+        st = max(1, npred // 50000)
+        pr = pred_pts[::st]
+        ax4.scatter(pr[:, 0], pr[:, 1], pr[:, 2], s=0.45, c="coral", alpha=0.55, depthshade=False)
+        _set_3d_equal_aspect(ax4, pr)
+        _draw_range_box_3d(ax4, box6)
+    ax4.set_title("Ricostruzione — altra vista")
     ax4.set_xlabel("x")
     ax4.set_ylabel("y")
     ax4.set_zlabel("z")
+    ax4.view_init(elev=10, azim=70)
 
     fig.suptitle("MSDNet teacher — forward su un frame casuale", fontsize=12)
     fig.tight_layout()

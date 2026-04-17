@@ -38,6 +38,47 @@ def find_velodyne_bin(vod_root: Path, frame_id: str) -> Optional[Path]:
     return None
 
 
+def _set_3d_equal_aspect(ax, xyz: np.ndarray) -> None:
+    """Cubo di visualizzazione centrato sui punti (evita assi 3D schiacciati)."""
+    if xyz.size == 0:
+        return
+    lo = xyz.min(axis=0)
+    hi = xyz.max(axis=0)
+    c = (lo + hi) / 2.0
+    r = max(float((hi - lo).max()) / 2.0, 0.25)
+    ax.set_xlim(c[0] - r, c[0] + r)
+    ax.set_ylim(c[1] - r, c[1] + r)
+    ax.set_zlim(c[2] - r, c[2] + r)
+    try:
+        ax.set_box_aspect((1, 1, 1))
+    except Exception:
+        pass
+
+
+def _draw_range_box_3d(ax, box6: List[float], **kw) -> None:
+    """Wireframe del parallelepipedo ``[x0,y0,z0,x1,y1,z1]``."""
+    x0, y0, z0, x1, y1, z1 = box6
+    edges = (
+        ((x0, y0, z0), (x1, y0, z0)),
+        ((x0, y1, z0), (x1, y1, z0)),
+        ((x0, y0, z1), (x1, y0, z1)),
+        ((x0, y1, z1), (x1, y1, z1)),
+        ((x0, y0, z0), (x0, y1, z0)),
+        ((x1, y0, z0), (x1, y1, z0)),
+        ((x0, y0, z1), (x0, y1, z1)),
+        ((x1, y0, z1), (x1, y1, z1)),
+        ((x0, y0, z0), (x0, y0, z1)),
+        ((x1, y0, z0), (x1, y0, z1)),
+        ((x0, y1, z0), (x0, y1, z1)),
+        ((x1, y1, z0), (x1, y1, z1)),
+    )
+    for a, b in edges:
+        ax.plot(
+            [a[0], b[0]], [a[1], b[1]], [a[2], b[2]],
+            **{"color": "red", "lw": 0.9, "alpha": 0.65, **kw},
+        )
+
+
 def load_raw_lidar_bin(path: Path) -> np.ndarray:
     data = np.fromfile(path, dtype=np.float32)
     if data.size % 4 != 0:
@@ -90,47 +131,52 @@ def plot_raw(
     xyz = plot_pc[:, :3]
     xi = plot_pc[:, 3]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
-
-    # BEV: x forward, y left — asse y invertito spesso in driving; qui dati così come sono
-    ax = axes[0]
+    fig = plt.figure(figsize=(13, 6))
+    ax = fig.add_subplot(1, 2, 1, projection="3d")
     sc = ax.scatter(
         xyz[:, 0],
         xyz[:, 1],
+        xyz[:, 2],
         c=xyz[:, 2],
         cmap="turbo",
-        s=0.25,
+        s=0.35,
         alpha=0.55,
+        depthshade=False,
         rasterized=True,
     )
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("x [m] (come nel .bin)")
+    ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
-    ax.set_title("BEV — colore = z" + note)
-    ax.grid(True, alpha=0.25)
-    plt.colorbar(sc, ax=ax, fraction=0.046, label="z")
+    ax.set_zlabel("z [m]")
+    ax.set_title("3D — colore = z" + note)
+    ax.view_init(elev=22, azim=-65)
+    _set_3d_equal_aspect(ax, xyz)
+    plt.colorbar(sc, ax=ax, fraction=0.04, shrink=0.65, label="z")
 
     if show_box is not None and len(show_box) == 6:
-        x0, y0, z0, x1, y1, z1 = show_box
-        ax.plot([x0, x1, x1, x0, x0], [y0, y0, y1, y1, y0], "r--", lw=1.2, alpha=0.85, label="MSDNet point_cloud_range (xy)")
-        ax.legend(loc="upper right", fontsize=8)
+        _draw_range_box_3d(ax, show_box)
 
-    ax2 = axes[1]
+    ax2 = fig.add_subplot(1, 2, 2, projection="3d")
     sc2 = ax2.scatter(
         xyz[:, 0],
         xyz[:, 1],
+        xyz[:, 2],
         c=xi,
         cmap="magma",
-        s=0.25,
+        s=0.35,
         alpha=0.55,
+        depthshade=False,
         rasterized=True,
     )
-    ax2.set_aspect("equal", adjustable="box")
     ax2.set_xlabel("x [m]")
     ax2.set_ylabel("y [m]")
-    ax2.set_title("BEV — colore = intensity")
-    ax2.grid(True, alpha=0.25)
-    plt.colorbar(sc2, ax=ax2, fraction=0.046, label="intensity")
+    ax2.set_zlabel("z [m]")
+    ax2.set_title("3D — colore = intensity")
+    ax2.view_init(elev=12, azim=55)
+    _set_3d_equal_aspect(ax2, xyz)
+    plt.colorbar(sc2, ax=ax2, fraction=0.04, shrink=0.65, label="intensity")
+
+    if show_box is not None and len(show_box) == 6:
+        _draw_range_box_3d(ax2, show_box)
 
     fig.suptitle(title, fontsize=10)
     fig.tight_layout()
