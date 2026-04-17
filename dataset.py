@@ -18,10 +18,103 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 
 _VOD_4DRVO_TEST_SEQS = frozenset({"03", "04", "22"})
+
+
+def _grid_dims_from_range(point_cloud_range: List[float], voxel_size: List[float]) -> Tuple[int, int, int]:
+    """Stessa convenzione di ``MSDNetConfig.grid_size``: celle lungo x, y, z nel volume VoD."""
+    pc = point_cloud_range
+    vs = voxel_size
+    gx = int((pc[3] - pc[0]) / vs[0])
+    gy = int((pc[4] - pc[1]) / vs[1])
+    gz = int((pc[5] - pc[2]) / vs[2])
+    return gx, gy, gz
+
+
+def decoder_volume_zyx(bev_h: int, bev_w: int, grid_z: int) -> Dict[int, Tuple[int, int, int]]:
+    """
+    Dimensioni (Z, Y, X) dei tensori ``occ_*`` prodotti da ``PointCloudReconstruction``
+    (lift z4=grid_z//4 da BEV, poi due ConvTranspose3d stride 2).
+    """
+    z4 = grid_z // 4
+    return {
+        4: (z4, bev_h, bev_w),
+        2: (z4 * 2, bev_h * 2, bev_w * 2),
+        1: (grid_z, bev_h * 4, bev_w * 4),
+    }
+
+
+def _world_steps_xyz(
+    tensor_nz: int, tensor_ny: int, tensor_nx: int, point_cloud_range: List[float]
+) -> Tuple[float, float, float, np.ndarray]:
+    """
+    Passi metrici lungo x, y, z per una griglia ``occ`` di forma (Z,Y,X)=(tensor_nz,tensor_ny,tensor_nx).
+
+    Allineato a ``PointCloudReconstruction.generate_point_cloud``:
+    ``vx = extent_x / n_x``, ``vy = extent_y / n_y``, ``vz = extent_z / n_z``.
+    """
+    pc_min = np.asarray(point_cloud_range[:3], dtype=np.float64)
+    pc_max = np.asarray(point_cloud_range[3:], dtype=np.float64)
+    ext = pc_max - pc_min
+    vx = float(ext[0] / tensor_nx)
+    vy = float(ext[1] / tensor_ny)
+    vz = float(ext[2] / tensor_nz)
+    return vx, vy, vz, pc_min
+
+
+def remove_ground_elevation_map(
+    points: np.ndarray,
+    ground_height: float = -1.5,
+    grid_size: float = 0.5,
+    height_threshold: float = 0.3,
+) -> np.ndarray:
+    """
+    Rimuove il suolo con mappa di elevazione su griglia BEV (stesso algoritmo di ``VoDDataset``).
+
+    Per ogni cella (x, y) tiene l'elevazione minima come stima del terreno; un punto è
+    tenuto se ``z - z_ground > height_threshold`` (o fallback ``z > ground_height``).
+
+    Args:
+        points: (N, 4+) float — usano solo le colonne ``x,y,z``.
+        ground_height: soglia z assoluta se la cella è vuota o la scena è degenere.
+        grid_size: passo della griglia BEV in metri.
+        height_threshold: altezza minima sopra il ground locale per tenere il punto.
+    """
+    if points.shape[0] == 0:
+        return points
+
+    xyz = points[:, :3]
+    x_min, x_max = xyz[:, 0].min(), xyz[:, 0].max()
+    y_min, y_max = xyz[:, 1].min(), xyz[:, 1].max()
+
+    if x_max - x_min < 0.1 or y_max - y_min < 0.1:
+        return points[xyz[:, 2] > ground_height]
+
+    x_bins = int((x_max - x_min) / grid_size) + 1
+    y_bins = int((y_max - y_min) / grid_size) + 1
+
+    ground_heights = np.full((x_bins, y_bins), np.inf)
+    x_indices = np.clip(((xyz[:, 0] - x_min) / grid_size).astype(int), 0, x_bins - 1)
+    y_indices = np.clip(((xyz[:, 1] - y_min) / grid_size).astype(int), 0, y_bins - 1)
+
+    for i in range(len(xyz)):
+        x_idx, y_idx = x_indices[i], y_indices[i]
+        ground_heights[x_idx, y_idx] = min(ground_heights[x_idx, y_idx], xyz[i, 2])
+
+    non_ground_mask = np.zeros(len(xyz), dtype=bool)
+    for i in range(len(xyz)):
+        x_idx, y_idx = x_indices[i], y_indices[i]
+        ground_h = ground_heights[x_idx, y_idx]
+
+        if ground_h == np.inf:
+            non_ground_mask[i] = xyz[i, 2] > ground_height
+        else:
+            non_ground_mask[i] = (xyz[i, 2] - ground_h) > height_threshold
+
+    return points[non_ground_mask]
 
 
 def extract_vod_sequence_id(frame_id: str) -> Optional[str]:
@@ -65,15 +158,17 @@ def _filter_frame_ids_4drvo_net(frame_ids: List[str], split: str) -> List[str]:
 
 class VoDDataset(Dataset):
     """
-    Expected directory layout:
-        root/
-            lidar/
-                000000.bin  (N, 4) float32  — x, y, z, intensity
-            radar/
-                000000.bin  (N, 5) float32  — x, y, z, intensity, velocity
-            split/
-                train.txt
-                test.txt
+    Layout atteso (MSDNet):
+        root/lidar/*.bin (N,4) float32, root/radar/*.bin (N,5), root/split/*.txt
+
+    **Pipeline LiDAR in ``__getitem__`` (ordine fisso):**
+        1. ``remove_ground_elevation_map`` — rimozione suolo (mappa di elevazione)
+        2. ``_crop_to_fov`` — FoV orizzontale radar
+        3. ``_crop_to_range`` — ``point_cloud_range``
+        4. ``_generate_gt`` — voxel GT allineati al decoder
+
+    Anteprima **senza** questi passi: ``python vod_pipeline.py preview ...``.
+    Schema testuale: ``python vod_pipeline.py pipeline``.
     """
 
     def __init__(self, root: str, split: str = "train",
@@ -198,52 +293,46 @@ class VoDDataset(Dataset):
     # ---- ground-truth voxel targets (multi-scale) ----
 
     def _generate_gt(self, lidar: np.ndarray):
-        """Build occupancy and offset GT matching EXACT model upsampling logic."""
-        pc_range = np.array(self.point_cloud_range)
-        base_vs = np.array(self.voxel_size)
-        pc_min = pc_range[:3]
-        
+        """
+        Occupancy e offset alle stesse dimensioni (Z,Y,X) di ``PointCloudReconstruction``.
+
+        I passi metrici per scala ricoprono l'intero ``point_cloud_range`` (nessun 16 m
+        artificiale su 32 m): ``vx = extent_x / n_x`` con ``n_x`` = larghezza tensor X, ecc.
+        """
+        gx, gy, gz = _grid_dims_from_range(self.point_cloud_range, self.voxel_size)
+        bev_h, bev_w = gx // 8, gy // 8
+        volumes = decoder_volume_zyx(bev_h, bev_w, gz)
+
         gt_occ, gt_offset = {}, {}
-        
-        # CRITICAL: Follow model's progressive upsampling logic
-        # Model starts from BEV size and progressively upsamples
-        
-        for scale in [4, 2, 1]:
-            if scale == 4:
-                # Scale 1/4: Model uses BEV dimensions directly
-                # BEV is 40x40 after 8x downsample, Z is grid_z//4
-                h_dim, w_dim = 40, 40  # BEV size from config
-                z_dim = 40 // 4        # grid_z // 4 = 10
-                actual_voxel_size = base_vs * 4  # [0.4, 0.4, 0.6]
-                
-            elif scale == 2:
-                # Scale 1/2: 2x upsample from scale 4
-                h_dim, w_dim = 40 * 2, 40 * 2  # 80x80
-                z_dim = 10 * 2                  # 20
-                actual_voxel_size = base_vs * 2  # [0.2, 0.2, 0.3]
-                
-            else:  # scale == 1
-                # Scale 1: 2x upsample from scale 2  
-                h_dim, w_dim = 80 * 2, 80 * 2   # 160x160
-                z_dim = 20 * 2                   # 40
-                actual_voxel_size = base_vs * 1  # [0.1, 0.1, 0.15]
-            
-# Debug print removed for clean training output
-            
-            # Create GT tensors matching model output dimensions EXACTLY
-            occ = np.zeros((1, z_dim, h_dim, w_dim), dtype=np.float32)
-            offset = np.zeros((3, z_dim, h_dim, w_dim), dtype=np.float32)
-            
-            # Voxelize points with the actual voxel size for this scale
-            coords = ((lidar[:, :3] - pc_min) / actual_voxel_size).astype(int)
-            coords = np.clip(coords, 0, np.array([w_dim, h_dim, z_dim]) - 1)
-            
-            for pt_idx in range(len(coords)):
-                xi, yi, zi = coords[pt_idx]
-                if 0 <= xi < w_dim and 0 <= yi < h_dim and 0 <= zi < z_dim:
-                    occ[0, zi, yi, xi] = 1.0
-                    center = pc_min + np.array([xi, yi, zi]) * actual_voxel_size + actual_voxel_size / 2
-                    offset[:, zi, yi, xi] = lidar[pt_idx, :3] - center
+        pc_range = self.point_cloud_range
+
+        for scale in (4, 2, 1):
+            nz, ny, nx = volumes[scale]
+            vx, vy, vz, pc_min = _world_steps_xyz(nz, ny, nx, pc_range)
+
+            occ = np.zeros((1, nz, ny, nx), dtype=np.float32)
+            offset = np.zeros((3, nz, ny, nx), dtype=np.float32)
+
+            if lidar.shape[0] == 0:
+                gt_occ[scale] = torch.from_numpy(occ)
+                gt_offset[scale] = torch.from_numpy(offset)
+                continue
+
+            ix = np.floor((lidar[:, 0] - pc_min[0]) / vx).astype(np.int64)
+            iy = np.floor((lidar[:, 1] - pc_min[1]) / vy).astype(np.int64)
+            iz = np.floor((lidar[:, 2] - pc_min[2]) / vz).astype(np.int64)
+            ix = np.clip(ix, 0, nx - 1)
+            iy = np.clip(iy, 0, ny - 1)
+            iz = np.clip(iz, 0, nz - 1)
+
+            for i in range(lidar.shape[0]):
+                xi, yi, zi = int(ix[i]), int(iy[i]), int(iz[i])
+                occ[0, zi, yi, xi] = 1.0
+                c0 = float(pc_min[0] + (xi + 0.5) * vx)
+                c1 = float(pc_min[1] + (yi + 0.5) * vy)
+                c2 = float(pc_min[2] + (zi + 0.5) * vz)
+                center = np.array([c0, c1, c2], dtype=np.float32)
+                offset[:, zi, yi, xi] = lidar[i, :3].astype(np.float32) - center
 
             gt_occ[scale] = torch.from_numpy(occ)
             gt_offset[scale] = torch.from_numpy(offset)
@@ -251,41 +340,13 @@ class VoDDataset(Dataset):
         return gt_occ, gt_offset
 
     def _ground_removal_elevation_map(self, points, grid_size=0.5, height_threshold=0.3):
-        """Standard elevation map ground removal."""
-        if points.shape[0] == 0:
-            return points
-            
-        xyz = points[:, :3]
-        x_min, x_max = xyz[:, 0].min(), xyz[:, 0].max()
-        y_min, y_max = xyz[:, 1].min(), xyz[:, 1].max()
-        
-        if x_max - x_min < 0.1 or y_max - y_min < 0.1:
-            return points[xyz[:, 2] > self.ground_height]
-        
-        x_bins = int((x_max - x_min) / grid_size) + 1
-        y_bins = int((y_max - y_min) / grid_size) + 1
-        
-        # Find ground level per cell
-        ground_heights = np.full((x_bins, y_bins), np.inf)
-        x_indices = np.clip(((xyz[:, 0] - x_min) / grid_size).astype(int), 0, x_bins - 1)
-        y_indices = np.clip(((xyz[:, 1] - y_min) / grid_size).astype(int), 0, y_bins - 1)
-        
-        for i in range(len(xyz)):
-            x_idx, y_idx = x_indices[i], y_indices[i]
-            ground_heights[x_idx, y_idx] = min(ground_heights[x_idx, y_idx], xyz[i, 2])
-        
-        # Classify points
-        non_ground_mask = np.zeros(len(xyz), dtype=bool)
-        for i in range(len(xyz)):
-            x_idx, y_idx = x_indices[i], y_indices[i]
-            ground_h = ground_heights[x_idx, y_idx]
-            
-            if ground_h == np.inf:
-                non_ground_mask[i] = xyz[i, 2] > self.ground_height
-            else:
-                non_ground_mask[i] = (xyz[i, 2] - ground_h) > height_threshold
-        
-        return points[non_ground_mask]
+        """Delega a :func:`remove_ground_elevation_map` con ``ground_height`` del dataset."""
+        return remove_ground_elevation_map(
+            points,
+            ground_height=self.ground_height,
+            grid_size=grid_size,
+            height_threshold=height_threshold,
+        )
 
 
 def collate_fn(batch):

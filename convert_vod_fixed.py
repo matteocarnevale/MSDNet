@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-FIXED VoD converter - applies range clipping to BOTH LiDAR and radar.
-Critical fix: radar coordinates must be within voxelization range.
+Converter VoD → layout MSDNet (``lidar/``, ``radar/``, ``split/``).
+
+**LiDAR:** con ``--lidar_ground elevation`` (consigliato) usa la stessa rimozione suolo di
+``dataset.remove_ground_elevation_map`` (come in training). Con ``simple`` solo ``z > -1.5``.
+Con ``--lidar_raw`` nessun filtro suolo. Poi (se non raw) si applica il crop ``point_cloud_range``.
+
+**Radar:** normalizza il numero di colonne e applica il crop di range.
+
+Ordine consigliato (anteprima grezza + dove va il ground): ``python vod_pipeline.py pipeline``.
 """
 
 import argparse
@@ -9,6 +16,8 @@ import shutil
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+
+from dataset import remove_ground_elevation_map
 
 
 def apply_range_clipping(points, point_cloud_range, min_points=10):
@@ -22,14 +31,35 @@ def apply_range_clipping(points, point_cloud_range, min_points=10):
     return clipped if clipped.shape[0] >= min_points else None
 
 
-def convert_vod_fixed(vod_root, output_dir, radar_type="radar_5frames"):
-    """Fixed converter with proper range clipping for both LiDAR and radar."""
+def convert_vod_fixed(
+    vod_root,
+    output_dir,
+    radar_type="radar_5frames",
+    lidar_raw: bool = False,
+    lidar_ground: str = "elevation",
+    ground_height: float = -1.5,
+    point_cloud_range=None,
+):
+    """
+    Args:
+        lidar_raw: se True, scrive il LiDAR velodyne così com'è (solo reshape N×4), senza
+            filtro suolo né range clipping.
+        lidar_ground: ``elevation`` | ``simple`` — ignorato se ``lidar_raw``.
+            elevation = mappa di elevazione (come ``VoDDataset``); simple = solo ``z > -1.5``.
+        ground_height: usato da ``remove_ground_elevation_map`` (default come il dataset).
+        point_cloud_range: lista 6 float ``[x0,y0,z0,x1,y1,z1]``; default paper/MSDNet.
+    """
+    if point_cloud_range is None:
+        point_cloud_range = [0, -16, -2, 32, 16, 4]
     vod_path = Path(vod_root)
     out_path = Path(output_dir)
     
-    print(f"FIXED VoD Converter")
-    print(f"Critical fix: Range clipping applied to BOTH sensors")
-    print(f"Point cloud range: [0, -16, -2, 32, 16, 4] (paper specification)")
+    print("VoD → MSDNet layout")
+    print(f"point_cloud_range: {point_cloud_range}")
+    if lidar_raw:
+        print("LiDAR: RAW (nessun ground removal, nessun crop)")
+    else:
+        print(f"LiDAR ground: {lidar_ground}  (ground_height={ground_height})")
     print(f"Source: {vod_path}")
     print(f"Output: {output_dir}")
     
@@ -59,11 +89,13 @@ def convert_vod_fixed(vod_root, output_dir, radar_type="radar_5frames"):
     
     all_frame_ids = sorted(all_frame_ids)
     
-    # Paper specification
-    point_cloud_range = [0, -16, -2, 32, 16, 4]
-    
     # Process LiDAR
-    print("Processing LiDAR (ground removal + range clipping)...")
+    if lidar_raw:
+        print("Processing LiDAR (RAW)...")
+    elif lidar_ground == "elevation":
+        print("Processing LiDAR (elevation-map ground removal + range clip)...")
+    else:
+        print("Processing LiDAR (simple z threshold + range clip)...")
     lidar_velodyne = lidar_dir / 'training' / 'velodyne'
     lidar_success = 0
     
@@ -76,16 +108,26 @@ def convert_vod_fixed(vod_root, output_dir, radar_type="radar_5frames"):
             data = np.fromfile(src_file, dtype=np.float32)
             if data.size % 4 == 0:
                 points = data.reshape(-1, 4)
-                
-                # Simple ground removal (paper: remove ground points)
-                points = points[points[:, 2] > -1.5]
-                
-                # Range clipping (critical!)
-                points = apply_range_clipping(points, point_cloud_range, min_points=20)
-                
-                if points is not None:
+
+                if lidar_raw:
+                    out_pts = points
+                else:
+                    if lidar_ground == "elevation":
+                        points = remove_ground_elevation_map(
+                            points,
+                            ground_height=ground_height,
+                            grid_size=0.5,
+                            height_threshold=0.3,
+                        )
+                    else:
+                        points = points[points[:, 2] > ground_height]
+                    out_pts = apply_range_clipping(
+                        points, point_cloud_range, min_points=20,
+                    )
+
+                if out_pts is not None and out_pts.shape[0] > 0:
                     dst_file = out_path / 'lidar' / f'{frame_id}.bin'
-                    points.astype(np.float32).tofile(dst_file)
+                    out_pts.astype(np.float32).tofile(dst_file)
                     lidar_success += 1
                     
         except Exception:
@@ -159,8 +201,10 @@ def convert_vod_fixed(vod_root, output_dir, radar_type="radar_5frames"):
             
             print(f"Updated {split_name}: {len(original_ids)} -> {len(valid_ids)}")
     
-    print(f"\nCRITICAL FIX APPLIED: Range clipping for both sensors")
-    print(f"All points now within: {point_cloud_range}")
+    if lidar_raw:
+        print("\nLiDAR: output = velodyne grezzo (nessun crop). Radar: ancora con range clip se applicabile.")
+    else:
+        print(f"\nLiDAR+radar (dove usato): punti filtrati dentro point_cloud_range = {point_cloud_range}")
     
 
 def main():
@@ -168,9 +212,33 @@ def main():
     parser.add_argument('--vod_root', required=True)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--radar_type', default='radar_5frames')
+    parser.add_argument(
+        '--lidar_raw',
+        action='store_true',
+        help='LiDAR: copia velodyne (N,4) senza ground removal e senza crop.',
+    )
+    parser.add_argument(
+        '--lidar_ground',
+        choices=('elevation', 'simple'),
+        default='elevation',
+        help='Come rimuovere il suolo prima del crop: elevation = come VoDDataset; simple = z > ground_height.',
+    )
+    parser.add_argument(
+        '--ground_height',
+        type=float,
+        default=-1.5,
+        help='Soglia z per simple mode e fallback in elevation (come VoDDataset.ground_height).',
+    )
     args = parser.parse_args()
-    
-    convert_vod_fixed(args.vod_root, args.output_dir, args.radar_type)
+
+    convert_vod_fixed(
+        args.vod_root,
+        args.output_dir,
+        args.radar_type,
+        lidar_raw=args.lidar_raw,
+        lidar_ground=args.lidar_ground,
+        ground_height=args.ground_height,
+    )
     print("Ready for training with fixed coordinates!")
 
 
