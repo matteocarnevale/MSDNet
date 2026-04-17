@@ -40,6 +40,18 @@ def parse_args():
     p.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     p.add_argument("--val_interval", type=int, default=10, help="Validation interval")
     p.add_argument("--save_interval", type=int, default=20, help="Checkpoint save interval")
+    p.add_argument(
+        "--vod_sequence_filter",
+        type=str,
+        default="none",
+        choices=("none", "4drvo_net"),
+        help="none: use split files. 4drvo_net: paper IV-A VoD split.",
+    )
+    p.add_argument(
+        "--ddim_backprop",
+        action="store_true",
+        help="Backprop through DDIM during training (high VRAM).",
+    )
     return p.parse_args()
 
 
@@ -164,11 +176,17 @@ def main():
         student.train()
         return total_loss / len(val_loader)
 
+    loss_ema = None
+    ema_decay = 0.99
+
     # Training loop
     for epoch in range(start_epoch, cfg.training.student_epochs):
         student.train()
         pbar = tqdm(train_loader,
                     desc=f"Student epoch {epoch+1}/{cfg.training.student_epochs}")
+        sums = {"total": 0.0, "recon": 0.0, "rec_distill": 0.0,
+                "diff_distill": 0.0, "diff": 0.0}
+        n_train_batches = 0
 
         for batch in pbar:
             lidar_list = [pc.to(device) for pc in batch["lidar"]]
@@ -192,20 +210,43 @@ def main():
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), 10.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 10.0)
             optimizer.step()
             scheduler.step()
 
+            lr = optimizer.param_groups[0]["lr"]
+            for k in sums:
+                sums[k] += loss_dict[k]
+            n_train_batches += 1
+
+            tot = loss_dict["total"]
+            if loss_ema is None:
+                loss_ema = tot
+            else:
+                loss_ema = ema_decay * loss_ema + (1.0 - ema_decay) * tot
+
+            gn = float(grad_norm)
+            run_ep = sums["total"] / n_train_batches
             pbar.set_postfix(
-                total=f"{loss_dict['total']:.3f}",
-                rec=f"{loss_dict['recon']:.3f}",
-                rd=f"{loss_dict['rec_distill']:.3f}",
-                dd=f"{loss_dict['diff_distill']:.3f}",
-                df=f"{loss_dict['diff']:.3f}",
+                tot=f"{tot:.3f}",
+                ema=f"{loss_ema:.3f}",
+                ep=f"{run_ep:.3f}",
+                lr=f"{lr:.1e}",
+                gn=f"{gn:.1f}",
+                rec=f"{loss_dict['recon']:.2f}",
+                rd=f"{loss_dict['rec_distill']:.2f}",
+                dd=f"{loss_dict['diff_distill']:.2f}",
+                df=f"{loss_dict['diff']:.2f}",
             )
             for k, v in loss_dict.items():
                 writer.add_scalar(f"student/{k}", v, global_step)
+            writer.add_scalar("student/total_ema", loss_ema, global_step)
+            writer.add_scalar("student/lr", lr, global_step)
+            writer.add_scalar("student/grad_norm", grad_norm, global_step)
             global_step += 1
+
+        for k, s in sums.items():
+            writer.add_scalar(f"student/train_{k}_epoch", s / max(n_train_batches, 1), epoch)
 
         # Validation
         val_loss = None

@@ -137,10 +137,15 @@ def main():
         model.train()
         return total_loss / len(val_loader)
 
+    loss_ema = None
+    ema_decay = 0.99
+
     # Training loop
     for epoch in range(start_epoch, cfg.training.teacher_epochs):
         model.train()
         pbar = tqdm(train_loader, desc=f"Teacher epoch {epoch+1}/{cfg.training.teacher_epochs}")
+        train_loss_sum = 0.0
+        n_train_batches = 0
 
         for batch in pbar:
             lidar_list = [pc.to(device) for pc in batch["lidar"]]
@@ -152,13 +157,36 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 10.0)
             optimizer.step()
             scheduler.step()
 
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
-            writer.add_scalar("teacher/loss", loss.item(), global_step)
+            li = loss.item()
+            train_loss_sum += li
+            n_train_batches += 1
+            if loss_ema is None:
+                loss_ema = li
+            else:
+                loss_ema = ema_decay * loss_ema + (1.0 - ema_decay) * li
+
+            lr = optimizer.param_groups[0]["lr"]
+            gn = float(grad_norm)
+            run_ep = train_loss_sum / n_train_batches
+            pbar.set_postfix(
+                loss=f"{li:.3f}",
+                ema=f"{loss_ema:.3f}",
+                ep=f"{run_ep:.3f}",
+                lr=f"{lr:.1e}",
+                gn=f"{gn:.1f}",
+            )
+            writer.add_scalar("teacher/loss", li, global_step)
+            writer.add_scalar("teacher/loss_ema", loss_ema, global_step)
+            writer.add_scalar("teacher/lr", lr, global_step)
+            writer.add_scalar("teacher/grad_norm", grad_norm, global_step)
             global_step += 1
+
+        train_epoch_mean = train_loss_sum / max(n_train_batches, 1)
+        writer.add_scalar("teacher/train_loss_epoch", train_epoch_mean, epoch)
 
         # Validation
         val_loss = None
