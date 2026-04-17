@@ -24,7 +24,7 @@ from tqdm import tqdm
 from config import MSDNetConfig
 from dataset import VoDDataset, collate_fn
 from models.msdnet import MSDNetTeacher, MSDNetStudent
-from losses import StudentLoss
+from losses import StudentLoss, reconstruction_loss_breakdown
 
 
 def parse_args():
@@ -156,9 +156,13 @@ def main():
 
     def validate():
         if val_loader is None:
-            return float('inf')
+            return float("inf"), {}, {}
         student.eval()
-        total_loss = 0
+        rho, zeta = cfg.loss.rho, cfg.loss.zeta
+        total_loss = 0.0
+        sum_dict = None
+        sum_recon_bd = None
+        n_batches = 0
         with torch.no_grad():
             for batch in val_loader:
                 lidar_list = [pc.to(device) for pc in batch["lidar"]]
@@ -171,13 +175,30 @@ def main():
                     radar_list, len(radar_list),
                     f_teacher=f_teacher, training=True,
                 )
-                total_loss_val, _ = criterion(student_out, f_teacher, gt_occ, gt_off)
+                total_loss_val, loss_dict = criterion(student_out, f_teacher, gt_occ, gt_off)
                 total_loss += total_loss_val.item()
+                if sum_dict is None:
+                    sum_dict = {k: 0.0 for k in loss_dict}
+                for k in loss_dict:
+                    sum_dict[k] += loss_dict[k]
+                bd = reconstruction_loss_breakdown(
+                    student_out["recon_out"], gt_occ, gt_off, rho, zeta,
+                )
+                if sum_recon_bd is None:
+                    sum_recon_bd = {k: 0.0 for k in bd}
+                for k in bd:
+                    sum_recon_bd[k] += bd[k]
+                n_batches += 1
         student.train()
-        return total_loss / len(val_loader)
+        n = max(n_batches, 1)
+        mean_dict = {k: sum_dict[k] / n for k in sum_dict}
+        mean_recon_bd = {k: sum_recon_bd[k] / n for k in sum_recon_bd}
+        return total_loss / len(val_loader), mean_dict, mean_recon_bd
 
     loss_ema = None
     ema_decay = 0.99
+    last_val_loss = None
+    rho, zeta = cfg.loss.rho, cfg.loss.zeta
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.student_epochs):
@@ -187,6 +208,9 @@ def main():
         sums = {"total": 0.0, "recon": 0.0, "rec_distill": 0.0,
                 "diff_distill": 0.0, "diff": 0.0}
         n_train_batches = 0
+        epoch_tot_min = float("inf")
+        epoch_tot_max = float("-inf")
+        bd_epoch_sum = None
 
         for batch in pbar:
             lidar_list = [pc.to(device) for pc in batch["lidar"]]
@@ -220,23 +244,43 @@ def main():
             n_train_batches += 1
 
             tot = loss_dict["total"]
+            epoch_tot_min = min(epoch_tot_min, tot)
+            epoch_tot_max = max(epoch_tot_max, tot)
             if loss_ema is None:
                 loss_ema = tot
             else:
                 loss_ema = ema_decay * loss_ema + (1.0 - ema_decay) * tot
 
+            bd = reconstruction_loss_breakdown(
+                student_out["recon_out"], gt_occ, gt_offset, rho, zeta,
+            )
+            if bd_epoch_sum is None:
+                bd_epoch_sum = {k: 0.0 for k in bd}
+            for k in bd:
+                bd_epoch_sum[k] += bd[k]
+            for k, v in bd.items():
+                writer.add_scalar(f"student/recon_{k}", v, global_step)
+
             gn = float(grad_norm)
             run_ep = sums["total"] / n_train_batches
+            val_str = f"{last_val_loss:.4f}" if last_val_loss is not None else "—"
+            best_str = f"{best_loss:.4f}" if best_loss < float("inf") else "—"
             pbar.set_postfix(
                 tot=f"{tot:.3f}",
                 ema=f"{loss_ema:.3f}",
                 ep=f"{run_ep:.3f}",
-                lr=f"{lr:.1e}",
-                gn=f"{gn:.1f}",
                 rec=f"{loss_dict['recon']:.2f}",
                 rd=f"{loss_dict['rec_distill']:.2f}",
                 dd=f"{loss_dict['diff_distill']:.2f}",
                 df=f"{loss_dict['diff']:.2f}",
+                occ=f"{bd['w_occ_total']:.2f}",
+                off=f"{bd['w_off_total']:.2f}",
+                lr=f"{lr:.1e}",
+                gn=f"{gn:.1f}",
+                vmin=f"{epoch_tot_min:.2f}",
+                vmax=f"{epoch_tot_max:.2f}",
+                val=val_str,
+                best=best_str,
             )
             for k, v in loss_dict.items():
                 writer.add_scalar(f"student/{k}", v, global_step)
@@ -245,15 +289,35 @@ def main():
             writer.add_scalar("student/grad_norm", grad_norm, global_step)
             global_step += 1
 
+        nbat = max(n_train_batches, 1)
         for k, s in sums.items():
-            writer.add_scalar(f"student/train_{k}_epoch", s / max(n_train_batches, 1), epoch)
+            writer.add_scalar(f"student/train_{k}_epoch", s / nbat, epoch)
+        writer.add_scalar("student/train_total_epoch_min", epoch_tot_min, epoch)
+        writer.add_scalar("student/train_total_epoch_max", epoch_tot_max, epoch)
+        if bd_epoch_sum is not None:
+            for k in bd_epoch_sum:
+                writer.add_scalar(
+                    f"student/recon_epoch_mean_{k}",
+                    bd_epoch_sum[k] / nbat,
+                    epoch,
+                )
 
         # Validation
         val_loss = None
         if (epoch + 1) % args.val_interval == 0:
-            val_loss = validate()
+            val_loss, val_mean_dict, val_recon_bd = validate()
+            last_val_loss = val_loss
             writer.add_scalar("student/val_loss", val_loss, epoch)
-            print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}")
+            for k, v in val_mean_dict.items():
+                writer.add_scalar(f"student/val_{k}", v, epoch)
+            for k, v in val_recon_bd.items():
+                writer.add_scalar(f"student/val_recon_{k}", v, epoch)
+            print(
+                f"Epoch {epoch+1} - val_total={val_loss:.6f}  "
+                f"recon={val_mean_dict.get('recon', 0):.4f}  "
+                f"w_occ={val_recon_bd.get('w_occ_total', 0):.4f}  "
+                f"w_off={val_recon_bd.get('w_off_total', 0):.4f}"
+            )
             
             # Save best model
             if val_loss < best_loss:

@@ -66,6 +66,33 @@ def reconstruction_loss(recon_out: dict,
     return total
 
 
+def reconstruction_loss_breakdown(
+    recon_out: dict,
+    gt_occ: dict,
+    gt_offset: dict,
+    rho: list,
+    zeta: list,
+) -> dict:
+    """Per-scale terms for TensorBoard / debugging (raw L_occ, L_off and weighted sums)."""
+    out = {}
+    w_occ_sum = torch.tensor(0.0, device=recon_out["occ_4"].device)
+    w_off_sum = torch.tensor(0.0, device=recon_out["occ_4"].device)
+    for i, s in enumerate([4, 2, 1]):
+        l_occ = occupancy_loss(recon_out[f"occ_{s}"], gt_occ[s])
+        l_off = offset_loss(recon_out[f"offset_{s}"], gt_offset[s], gt_occ[s])
+        wo = rho[i] * l_occ
+        wz = zeta[i] * l_off
+        w_occ_sum = w_occ_sum + wo
+        w_off_sum = w_off_sum + wz
+        out[f"L_occ_s{s}"] = float(l_occ.detach().item())
+        out[f"L_off_s{s}"] = float(l_off.detach().item())
+        out[f"w_occ_s{s}"] = float(wo.detach().item())
+        out[f"w_off_s{s}"] = float(wz.detach().item())
+    out["w_occ_total"] = float(w_occ_sum.detach().item())
+    out["w_off_total"] = float(w_off_sum.detach().item())
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Feature distillation losses (Eqs. 8 and 14)
 # ---------------------------------------------------------------------------

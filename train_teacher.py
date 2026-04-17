@@ -19,7 +19,7 @@ from tqdm import tqdm
 from config import MSDNetConfig
 from dataset import VoDDataset, collate_fn
 from models.msdnet import MSDNetTeacher
-from losses import TeacherLoss
+from losses import TeacherLoss, reconstruction_loss_breakdown
 
 
 def parse_args():
@@ -122,23 +122,36 @@ def main():
 
     def validate():
         if val_loader is None:
-            return float('inf')
+            return float("inf"), {}
         model.eval()
-        total_loss = 0
+        total_loss = 0.0
+        bd_sum = None
+        n_batches = 0
+        rho, zeta = cfg.loss.rho, cfg.loss.zeta
         with torch.no_grad():
             for batch in val_loader:
                 lidar_list = [pc.to(device) for pc in batch["lidar"]]
                 gt_occ = {s: v.to(device) for s, v in batch["gt_occ"].items()}
                 gt_off = {s: v.to(device) for s, v in batch["gt_offset"].items()}
-                
+
                 _, recon_out = model(lidar_list, len(lidar_list))
                 loss = criterion(recon_out, gt_occ, gt_off)
                 total_loss += loss.item()
+                bd = reconstruction_loss_breakdown(recon_out, gt_occ, gt_off, rho, zeta)
+                if bd_sum is None:
+                    bd_sum = {k: 0.0 for k in bd}
+                for k in bd:
+                    bd_sum[k] += bd[k]
+                n_batches += 1
         model.train()
-        return total_loss / len(val_loader)
+        for k in bd_sum:
+            bd_sum[k] /= max(n_batches, 1)
+        return total_loss / len(val_loader), bd_sum
 
     loss_ema = None
     ema_decay = 0.99
+    last_val_loss = None
+    rho, zeta = cfg.loss.rho, cfg.loss.zeta
 
     # Training loop
     for epoch in range(start_epoch, cfg.training.teacher_epochs):
@@ -146,6 +159,9 @@ def main():
         pbar = tqdm(train_loader, desc=f"Teacher epoch {epoch+1}/{cfg.training.teacher_epochs}")
         train_loss_sum = 0.0
         n_train_batches = 0
+        epoch_loss_min = float("inf")
+        epoch_loss_max = float("-inf")
+        bd_epoch_sum = None
 
         for batch in pbar:
             lidar_list = [pc.to(device) for pc in batch["lidar"]]
@@ -164,20 +180,39 @@ def main():
             li = loss.item()
             train_loss_sum += li
             n_train_batches += 1
+            epoch_loss_min = min(epoch_loss_min, li)
+            epoch_loss_max = max(epoch_loss_max, li)
             if loss_ema is None:
                 loss_ema = li
             else:
                 loss_ema = ema_decay * loss_ema + (1.0 - ema_decay) * li
 
+            bd = reconstruction_loss_breakdown(recon_out, gt_occ, gt_offset, rho, zeta)
+            if bd_epoch_sum is None:
+                bd_epoch_sum = {k: 0.0 for k in bd}
+            for k in bd:
+                bd_epoch_sum[k] += bd[k]
+            for k, v in bd.items():
+                writer.add_scalar(f"teacher/train_{k}", v, global_step)
+            writer.add_scalar("teacher/train_total_approx", bd["w_occ_total"] + bd["w_off_total"], global_step)
+
             lr = optimizer.param_groups[0]["lr"]
             gn = float(grad_norm)
             run_ep = train_loss_sum / n_train_batches
+            val_str = f"{last_val_loss:.4f}" if last_val_loss is not None else "—"
+            best_str = f"{best_loss:.4f}" if best_loss < float("inf") else "—"
             pbar.set_postfix(
                 loss=f"{li:.3f}",
                 ema=f"{loss_ema:.3f}",
                 ep=f"{run_ep:.3f}",
+                occ=f"{bd['w_occ_total']:.2f}",
+                off=f"{bd['w_off_total']:.2f}",
                 lr=f"{lr:.1e}",
                 gn=f"{gn:.1f}",
+                vmin=f"{epoch_loss_min:.2f}",
+                vmax=f"{epoch_loss_max:.2f}",
+                val=val_str,
+                best=best_str,
             )
             writer.add_scalar("teacher/loss", li, global_step)
             writer.add_scalar("teacher/loss_ema", loss_ema, global_step)
@@ -187,13 +222,29 @@ def main():
 
         train_epoch_mean = train_loss_sum / max(n_train_batches, 1)
         writer.add_scalar("teacher/train_loss_epoch", train_epoch_mean, epoch)
+        writer.add_scalar("teacher/train_loss_epoch_min", epoch_loss_min, epoch)
+        writer.add_scalar("teacher/train_loss_epoch_max", epoch_loss_max, epoch)
+        if bd_epoch_sum is not None and n_train_batches > 0:
+            for k in bd_epoch_sum:
+                writer.add_scalar(
+                    f"teacher/train_epoch_mean_{k}",
+                    bd_epoch_sum[k] / n_train_batches,
+                    epoch,
+                )
 
         # Validation
         val_loss = None
         if (epoch + 1) % args.val_interval == 0:
-            val_loss = validate()
+            val_loss, val_bd = validate()
+            last_val_loss = val_loss
             writer.add_scalar("teacher/val_loss", val_loss, epoch)
-            print(f"Epoch {epoch+1} - Val Loss: {val_loss:.4f}")
+            for k, v in val_bd.items():
+                writer.add_scalar(f"teacher/val_{k}", v, epoch)
+            print(
+                f"Epoch {epoch+1} - val_loss={val_loss:.6f}  "
+                f"w_occ={val_bd.get('w_occ_total', 0):.4f}  "
+                f"w_off={val_bd.get('w_off_total', 0):.4f}"
+            )
             
             # Save best model
             if val_loss < best_loss:
