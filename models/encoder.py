@@ -199,11 +199,15 @@ class VFE(nn.Module):
     
     def __init__(self, in_features: int, out_channels: int):
         super().__init__()
-        # Paper config for LiDAR: VFE-1(7,32) + VFE-2(32,128) + final FCN
-        # We start with 4 features (x,y,z,intensity), add centroid offset -> 7
-        # Then VFE-1(7,32), VFE-2(32,64), final to out_channels
-        
-        self.vfe1 = VFELayer(7, 32)        # First VFE: 7->16, concat->32
+        # Paper config uses 7-D point features for LiDAR:
+        #   [x, y, z, intensity] + [x-vx, y-vy, z-vz] = 4 + 3 = 7
+        # In our code we generalize to any in_features:
+        #   [all input features] + [centroid offsets for xyz] = in_features + 3
+        #
+        # For radar (x,y,z,intensity,velocity): 5 + 3 = 8
+        augmented_in = in_features + 3
+
+        self.vfe1 = VFELayer(augmented_in, 32)  # First VFE: augmented_in -> 16, concat -> 32
         self.vfe2 = VFELayer(32, 64)       # Second VFE: 32->32, concat->64
         
         # Final FCN + max pooling (no concatenation)
@@ -213,10 +217,10 @@ class VFE(nn.Module):
         
     def forward(self, voxel_features, num_points):
         """
-        Paper-faithful forward with 7-D input and concatenation.
+        Paper-faithful forward with centroid-offset augmentation and concatenation.
         
         Args:
-            voxel_features: (V, max_pts, 4) [x,y,z,intensity]
+            voxel_features: (V, max_pts, F) e.g. LiDAR F=4, radar F=5
             num_points:     (V,) number of valid points per voxel
         Returns:
             (V, out_channels) voxel-wise features
@@ -228,20 +232,19 @@ class VFE(nn.Module):
         
         # Compute centroids for each voxel
         masked_features = voxel_features * mask.unsqueeze(-1).float()
-        centroids = masked_features.sum(dim=1) / num_points.clamp(min=1).unsqueeze(-1).float()  # (V, 4)
+        centroids = masked_features.sum(dim=1) / num_points.clamp(min=1).unsqueeze(-1).float()  # (V, F)
         
         # Paper step 2: Augment points with centroid offsets (7-D input)
-        centroids_expanded = centroids.unsqueeze(1).expand(-1, T, -1)  # (V, T, 4)
+        centroids_expanded = centroids.unsqueeze(1).expand(-1, T, -1)  # (V, T, F)
         centroid_offsets = voxel_features[:, :, :3] - centroids_expanded[:, :, :3]  # (V, T, 3)
         
-        # Create 7-D input: [x, y, z, intensity, x-vx, y-vy, z-vz]
-        inputs_7d = torch.cat([
-            voxel_features,           # (V, T, 4) - x,y,z,intensity
-            centroid_offsets         # (V, T, 3) - centroid offsets
-        ], dim=-1)                   # (V, T, 7)
+        # Create augmented input: [all features] + [xyz centroid offsets]
+        inputs_aug = torch.cat(
+            [voxel_features, centroid_offsets], dim=-1
+        )  # (V, T, F+3)
         
         # Paper VFE layers with concatenation
-        x = self.vfe1(inputs_7d, mask)    # (V, T, 32)
+        x = self.vfe1(inputs_aug, mask)    # (V, T, 32)
         x = self.vfe2(x, mask)            # (V, T, 64)
         
         # Final aggregation (max pooling, no concatenation)
