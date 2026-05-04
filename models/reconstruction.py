@@ -133,9 +133,15 @@ class PointCloudReconstruction(nn.Module):
         offset = preds["offset_1"]                          # (B,3,Z,Y,X)
 
         B, _, Z, Y, X = occ.shape
-        voxel_x, voxel_y, voxel_z = self.voxel_size
-        pc_min = torch.tensor(point_cloud_range[:3],
-                              device=occ.device) if point_cloud_range else torch.zeros(3, device=occ.device)
+        if point_cloud_range is not None:
+            pcr = point_cloud_range
+            voxel_x = (pcr[3] - pcr[0]) / X
+            voxel_y = (pcr[4] - pcr[1]) / Y
+            voxel_z = (pcr[5] - pcr[2]) / Z
+            pc_min = torch.tensor(pcr[:3], device=occ.device)
+        else:
+            voxel_x, voxel_y, voxel_z = self.voxel_size
+            pc_min = torch.zeros(3, device=occ.device)
 
         point_clouds = []
         for batch_idx in range(B):
