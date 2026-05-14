@@ -1,370 +1,518 @@
-"""Dataset class for the View-of-Delft (VoD) dataset.
+"""RADIal Dataset for MSDNet.
 
-Provides synchronised LiDAR and 4D radar point cloud pairs for training
-and evaluation.  Ground-truth occupancy and offset targets are generated
-on-the-fly from the LiDAR point clouds via voxelization.
+Reads the `radar_lidar_pc_dataset` folder produced by build_radial_dataset.py.
 
-Preprocessing follows R2LDM (Zheng et al., 2025):
-    1. Remove ground points from LiDAR (simple height threshold).
-    2. Crop LiDAR points to match the 4D radar FoV.
+Folder layout:
+    <root>/
+        radar_PCL/      pcl_{id:06d}.npy   [9, N]   radar point cloud
+        laser_PCL/      pcl_{id:06d}.npy   [M, 3]   raw LiDAR XYZ
+        laser_PCL_ng/   pcl_{id:06d}.npy   [M, 4]   ← auto-generated on first run
+                                                       ground-removed LiDAR + intensity=1
+        index.csv       sample manifest (sample_id, sequence, …)
+        radar_columns.txt
 
-Optional ``vod_sequence_filter="4drvo_net"``: MSDNet paper IV-A VoD split
-(sequences 03, 04, 22 in test). Frame ids should look like ``delft_03_...``.
+Ground removal (RANSAC plane fitting):
+    On first access each raw LiDAR frame is processed:
+      1. Collect the lowest `candidate_percentile` % of points as ground candidates.
+      2. RANSAC: sample 3 candidate points → fit plane → count inliers.
+      3. Keep the plane with the most inliers after `n_iters` trials.
+      4. Discard all points within `above_margin` metres of (or below) the plane.
+    Result is saved to laser_PCL_ng/ and reused on every subsequent epoch.
+    Fallback to a simple z-threshold if fewer than 3 points are available.
+
+Radar PCL columns (stored as [9, N], rows = features):
+    0 range_m  1 azimuth_rad  2 elevation_rad  3 power_db  4 doppler_bin
+    5 x_m  6 y_m  7 z_m  8 v_bin_centered ∈ [-128, 127]
+
+MSDNet features:
+    radar → [x_m, y_m, z_m, power_norm, v_norm]     (N, 5)
+    lidar → [x,   y,   z,   intensity=1]             (M, 4)
+
+Split: sequence-based (whole drives). See get_splits() / print_split_info().
 """
 
-import os
-import re
-import numpy as np
-import torch
-from torch.utils.data import Dataset
-from tqdm import tqdm
+from __future__ import annotations
+
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-
-_VOD_4DRVO_TEST_SEQS = frozenset({"03", "04", "22"})
-
-
-def _grid_dims_from_range(point_cloud_range: List[float], voxel_size: List[float]) -> Tuple[int, int, int]:
-    """Stessa convenzione di ``MSDNetConfig.grid_size``: celle lungo x, y, z nel volume VoD."""
-    pc = point_cloud_range
-    vs = voxel_size
-    gx = int((pc[3] - pc[0]) / vs[0])
-    gy = int((pc[4] - pc[1]) / vs[1])
-    gz = int((pc[5] - pc[2]) / vs[2])
-    return gx, gy, gz
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 
-def decoder_volume_zyx(bev_h: int, bev_w: int, grid_z: int) -> Dict[int, Tuple[int, int, int]]:
+# ---------------------------------------------------------------------------
+# Radar feature indices inside the [9, N] array
+# ---------------------------------------------------------------------------
+
+_COL_RANGE_M       = 0
+_COL_AZIMUTH_RAD   = 1
+_COL_ELEVATION_RAD = 2
+_COL_POWER_DB      = 3
+_COL_DOPPLER_BIN   = 4
+_COL_X_M           = 5
+_COL_Y_M           = 6
+_COL_Z_M           = 7
+_COL_V_BIN         = 8   # v_bin_centered ∈ [-128, 127]
+
+_DOPPLER_MAX       = 128.0   # normalisation constant for v_bin_centered
+
+
+# ---------------------------------------------------------------------------
+# Splits  (sequence-based  —  no temporal / geographic leakage)
+# ---------------------------------------------------------------------------
+
+def get_splits(
+    root_dir: str | Path,
+    train_ratio: float = 0.70,
+    val_ratio:   float = 0.15,
+    seed:        int   = 42,
+) -> Tuple[List[int], List[int], List[int]]:
     """
-    Dimensioni (Z, Y, X) dei tensori ``occ_*`` prodotti da ``PointCloudReconstruction``
-    (lift z4=grid_z//4 da BEV, poi due ConvTranspose3d stride 2).
+    Sequence-based train / val / test split from index.csv.
+
+    Why sequence-based?
+        Consecutive frames in the same drive are strongly correlated
+        (same road, same weather, high overlap between frames).
+        Splitting by frame would leak future/past frames from the same
+        sequence into the validation set → inflated metrics.
+
+    How it works:
+        1. Read the unique 'sequence' values from index.csv.
+        2. Shuffle them deterministically with `seed`.
+        3. Assign the first 70 % to train, the next 15 % to val, the rest to test.
+        4. Return the corresponding sample_ids for each split.
+
+    Returns:
+        (train_ids, val_ids, test_ids) — lists of integer sample_ids.
+    """
+    root = Path(root_dir)
+    df   = pd.read_csv(root / "index.csv")
+
+    _check_columns(df, required=["sample_id", "sequence"])
+
+    sequences = sorted(df["sequence"].unique())
+    rng  = np.random.default_rng(seed)
+    seqs = np.array(sequences)
+    rng.shuffle(seqs)
+
+    n       = len(seqs)
+    n_train = int(n * train_ratio)
+    n_val   = int(n * val_ratio)
+
+    train_seqs = set(seqs[:n_train])
+    val_seqs   = set(seqs[n_train : n_train + n_val])
+    test_seqs  = set(seqs[n_train + n_val :])
+
+    def _ids(seq_set):
+        return df[df["sequence"].isin(seq_set)]["sample_id"].tolist()
+
+    return _ids(train_seqs), _ids(val_seqs), _ids(test_seqs)
+
+
+def print_split_info(
+    root_dir: str | Path,
+    train_ids: List[int],
+    val_ids:   List[int],
+    test_ids:  List[int],
+) -> None:
+    """Print a human-readable summary of the split."""
+    root = Path(root_dir)
+    df   = pd.read_csv(root / "index.csv")
+
+    def _seq_names(ids):
+        return sorted(df[df["sample_id"].isin(ids)]["sequence"].unique())
+
+    tr_seqs = _seq_names(train_ids)
+    va_seqs = _seq_names(val_ids)
+    te_seqs = _seq_names(test_ids)
+
+    total = len(train_ids) + len(val_ids) + len(test_ids)
+    print("=" * 60)
+    print(f"Dataset split summary  ({total} total frames)")
+    print("=" * 60)
+    print(f"  Train : {len(train_ids):>6}  frames  "
+          f"({len(tr_seqs)} sequences, {100*len(train_ids)/total:.1f}%)")
+    print(f"  Val   : {len(val_ids):>6}  frames  "
+          f"({len(va_seqs)} sequences, {100*len(val_ids)/total:.1f}%)")
+    print(f"  Test  : {len(test_ids):>6}  frames  "
+          f"({len(te_seqs)} sequences, {100*len(test_ids)/total:.1f}%)")
+    print()
+    print("  Train sequences:")
+    for s in tr_seqs: print(f"    {s}")
+    print("  Val sequences:")
+    for s in va_seqs: print(f"    {s}")
+    print("  Test sequences:")
+    for s in te_seqs: print(f"    {s}")
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# GT helpers  (self-contained)
+# ---------------------------------------------------------------------------
+
+def _gt_volume_shapes(
+    bev_h: int, bev_w: int, grid_z: int
+) -> Dict[int, Tuple[int, int, int]]:
+    """
+    (nz, nh, nw) of the GT tensors at each reconstruction scale.
+
+    Must match PointCloudReconstruction output exactly:
+      scale 4: (z//4, bev_h,   bev_w)
+      scale 2: (z//2, bev_h*2, bev_w*2)
+      scale 1: (z,    bev_h*4, bev_w*4)
+
+    Args:
+        bev_h: H_bev = Y_cells // 8  (row = lateral dimension)
+        bev_w: W_bev = X_cells // 8  (col = forward dimension)
     """
     z4 = grid_z // 4
     return {
-        4: (z4, bev_h, bev_w),
+        4: (z4,     bev_h,     bev_w),
         2: (z4 * 2, bev_h * 2, bev_w * 2),
         1: (grid_z, bev_h * 4, bev_w * 4),
     }
 
 
-def _world_steps_xyz(
-    tensor_nz: int, tensor_ny: int, tensor_nx: int, point_cloud_range: List[float]
-) -> Tuple[float, float, float, np.ndarray]:
+def _generate_gt(
+    lidar_xyz:     np.ndarray,
+    pc_range:      List[float],
+    volume_shapes: Dict[int, Tuple[int, int, int]],
+) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
     """
-    Passi metrici lungo x, y, z per una griglia ``occ`` di forma (Z,Y,X)=(tensor_nz,tensor_ny,tensor_nx).
+    Multi-scale occupancy and offset GT from LiDAR XYZ.
 
-    Allineato a ``PointCloudReconstruction.generate_point_cloud``:
-    ``vx = extent_x / n_x``, ``vy = extent_y / n_y``, ``vz = extent_z / n_z``.
+    Tensor ordering: (1, nz, nh, nw) = (1, Z, Y, X)
+    Consistent with PointCloudReconstruction output.
     """
-    pc_min = np.asarray(point_cloud_range[:3], dtype=np.float64)
-    pc_max = np.asarray(point_cloud_range[3:], dtype=np.float64)
-    ext = pc_max - pc_min
-    vx = float(ext[0] / tensor_nx)
-    vy = float(ext[1] / tensor_ny)
-    vz = float(ext[2] / tensor_nz)
-    return vx, vy, vz, pc_min
+    pc_min  = np.array(pc_range[:3], dtype=np.float64)
+    extent  = np.array(pc_range[3:], dtype=np.float64) - pc_min
+
+    gt_occ, gt_off = {}, {}
+
+    for scale, (nz, nh, nw) in volume_shapes.items():
+        vx = extent[0] / nw    # X step  (col)
+        vy = extent[1] / nh    # Y step  (row)
+        vz = extent[2] / nz    # Z step  (depth)
+
+        occ = np.zeros((1, nz, nh, nw), dtype=np.float32)
+        off = np.zeros((3, nz, nh, nw), dtype=np.float32)
+
+        if lidar_xyz.shape[0] > 0:
+            xyz = lidar_xyz[:, :3]
+            ic  = np.clip(((xyz[:, 0] - pc_min[0]) / vx).astype(int), 0, nw - 1)
+            ir  = np.clip(((xyz[:, 1] - pc_min[1]) / vy).astype(int), 0, nh - 1)
+            iz  = np.clip(((xyz[:, 2] - pc_min[2]) / vz).astype(int), 0, nz - 1)
+
+            occ[0, iz, ir, ic] = 1.0
+
+            cx = pc_min[0] + (ic + 0.5) * vx
+            cy = pc_min[1] + (ir + 0.5) * vy
+            cz = pc_min[2] + (iz + 0.5) * vz
+            off[0, iz, ir, ic] = (xyz[:, 0] - cx).astype(np.float32)
+            off[1, iz, ir, ic] = (xyz[:, 1] - cy).astype(np.float32)
+            off[2, iz, ir, ic] = (xyz[:, 2] - cz).astype(np.float32)
+
+        gt_occ[scale] = torch.from_numpy(occ)
+        gt_off[scale] = torch.from_numpy(off)
+
+    return gt_occ, gt_off
 
 
-def remove_ground_elevation_map(
-    points: np.ndarray,
-    ground_height: float = -1.5,
-    grid_size: float = 0.5,
-    height_threshold: float = 0.3,
+# ---------------------------------------------------------------------------
+# RANSAC ground removal
+# ---------------------------------------------------------------------------
+
+def _ransac_ground_removal(
+    pts:                  np.ndarray,
+    n_iters:              int   = 100,
+    dist_thresh:          float = 0.20,   # inlier distance from plane (metres)
+    candidate_percentile: float = 20.0,   # sample candidates from lowest N% by z
+    above_margin:         float = 0.10,   # keep points > this height above plane
+    seed:                 int   = 0,
 ) -> np.ndarray:
     """
-    Rimuove il suolo con mappa di elevazione su griglia BEV (stesso algoritmo di ``VoDDataset``).
+    Fit a ground plane with RANSAC and remove all points at or below it.
 
-    Per ogni cella (x, y) tiene l'elevazione minima come stima del terreno; un punto è
-    tenuto se ``z - z_ground > height_threshold`` (o fallback ``z > ground_height``).
+    Algorithm:
+      1. Restrict RANSAC sampling to the lowest `candidate_percentile` % by z
+         (avoids wasting iterations on obvious non-ground points).
+      2. For each iteration: sample 3 candidates, compute plane normal via
+         cross-product, count points within `dist_thresh` of the plane.
+      3. After `n_iters` trials keep the best-supported plane.
+      4. Discard points whose signed distance from the best plane is less
+         than `above_margin` (i.e. on the ground or below it).
+
+    Falls back to a simple z-threshold (-1.0 m) when fewer than 3 candidate
+    points are available.
 
     Args:
-        points: (N, 4+) float — usano solo le colonne ``x,y,z``.
-        ground_height: soglia z assoluta se la cella è vuota o la scena è degenere.
-        grid_size: passo della griglia BEV in metri.
-        height_threshold: altezza minima sopra il ground locale per tenere il punto.
+        pts:    (M, 3) float32 XYZ array.
+    Returns:
+        (M', 3) float32 — points above the ground plane.
     """
-    if points.shape[0] == 0:
-        return points
+    if pts.shape[0] < 3:
+        return pts
 
-    xyz = points[:, :3]
-    x_min, x_max = xyz[:, 0].min(), xyz[:, 0].max()
-    y_min, y_max = xyz[:, 1].min(), xyz[:, 1].max()
+    # Step 1: ground candidates = lowest percentile
+    z_cut = np.percentile(pts[:, 2], candidate_percentile)
+    cand  = pts[pts[:, 2] <= z_cut]
 
-    if x_max - x_min < 0.1 or y_max - y_min < 0.1:
-        return points[xyz[:, 2] > ground_height]
+    if cand.shape[0] < 3:
+        # Fallback: simple height threshold relative to min z
+        z_floor = pts[:, 2].min() + 0.3
+        return pts[pts[:, 2] > z_floor]
 
-    x_bins = int((x_max - x_min) / grid_size) + 1
-    y_bins = int((y_max - y_min) / grid_size) + 1
+    rng          = np.random.default_rng(seed)
+    best_normal  = None
+    best_d       = 0.0
+    best_count   = 0
 
-    ground_heights = np.full((x_bins, y_bins), np.inf)
-    x_indices = np.clip(((xyz[:, 0] - x_min) / grid_size).astype(int), 0, x_bins - 1)
-    y_indices = np.clip(((xyz[:, 1] - y_min) / grid_size).astype(int), 0, y_bins - 1)
+    for _ in range(n_iters):
+        idx = rng.choice(len(cand), 3, replace=False)
+        p1, p2, p3 = cand[idx[0]], cand[idx[1]], cand[idx[2]]
 
-    for i in range(len(xyz)):
-        x_idx, y_idx = x_indices[i], y_indices[i]
-        ground_heights[x_idx, y_idx] = min(ground_heights[x_idx, y_idx], xyz[i, 2])
+        # Plane normal via cross-product
+        normal = np.cross(p2 - p1, p3 - p1)
+        mag    = np.linalg.norm(normal)
+        if mag < 1e-8:
+            continue           # degenerate — three collinear points
+        normal /= mag
+        d = -float(np.dot(normal, p1))
 
-    non_ground_mask = np.zeros(len(xyz), dtype=bool)
-    for i in range(len(xyz)):
-        x_idx, y_idx = x_indices[i], y_indices[i]
-        ground_h = ground_heights[x_idx, y_idx]
+        # Inliers across ALL points
+        signed = pts @ normal + d
+        n_in   = int((np.abs(signed) < dist_thresh).sum())
 
-        if ground_h == np.inf:
-            non_ground_mask[i] = xyz[i, 2] > ground_height
-        else:
-            non_ground_mask[i] = (xyz[i, 2] - ground_h) > height_threshold
+        if n_in > best_count:
+            best_count  = n_in
+            best_normal = normal.copy()
+            best_d      = d
 
-    return points[non_ground_mask]
+    if best_normal is None:
+        z_floor = pts[:, 2].min() + 0.3
+        return pts[pts[:, 2] > z_floor]
 
+    # Ensure the normal points upward (positive z component)
+    if best_normal[2] < 0:
+        best_normal = -best_normal
+        best_d      = -best_d
 
-def extract_vod_sequence_id(frame_id: str) -> Optional[str]:
-    """Two-digit sequence id from a VoD-style frame id, or None."""
-    fid = frame_id.replace("\\", "/")
-    m = re.search(r"delft_(\d+)_", fid, flags=re.I)
-    if m:
-        return f"{int(m.group(1)):02d}"
-    m = re.match(r"^(\d{2})_\d+", fid)
-    if m:
-        return m.group(1)
-    m = re.match(r"^(\d{2})\d{6,}$", fid)
-    if m:
-        return m.group(1)
-    return None
+    # Keep points more than `above_margin` metres above the fitted plane
+    signed_dist = pts @ best_normal + best_d
+    return pts[signed_dist > above_margin]
 
 
-def _filter_frame_ids_4drvo_net(frame_ids: List[str], split: str) -> List[str]:
-    out = []
-    skipped = 0
-    for fid in frame_ids:
-        seq = extract_vod_sequence_id(fid)
-        if seq is None:
-            skipped += 1
-            continue
-        in_test = seq in _VOD_4DRVO_TEST_SEQS
-        if split == "train" and not in_test:
-            out.append(fid)
-        elif split == "test" and in_test:
-            out.append(fid)
-        elif split not in ("train", "test"):
-            if not in_test:
-                out.append(fid)
-    if skipped:
-        print(
-            f"Dataset 4drvo_net: skipped {skipped} ids (unparsable sequence; "
-            "expected e.g. delft_03_...)"
-        )
+# ---------------------------------------------------------------------------
+# Preprocessing helpers
+# ---------------------------------------------------------------------------
+
+def _process_radar(
+    raw: np.ndarray,
+    pc_range: List[float],
+) -> np.ndarray:
+    """
+    Convert raw [9, N] radar PCL → MSDNet [N, 5] feature tensor.
+
+    Input rows: range_m, az_rad, el_rad, power_db, doppler_bin,
+                x_m, y_m, z_m, v_bin_centered
+    Output cols: x_m, y_m, z_m, power_norm ∈ [0,1], v_norm ∈ [-1,1]
+    """
+    if raw.size == 0 or raw.shape[1] == 0:
+        return np.zeros((0, 5), dtype=np.float32)
+
+    pcl = raw.T.astype(np.float32)   # (N, 9)
+
+    x = pcl[:, _COL_X_M]
+    y = pcl[:, _COL_Y_M]
+    z = pcl[:, _COL_Z_M]
+    p = pcl[:, _COL_POWER_DB]
+    v = pcl[:, _COL_V_BIN]
+
+    p_norm = (p - p.min()) / (p.max() - p.min() + 1e-8)   # per-frame [0,1]
+    v_norm = v / _DOPPLER_MAX                               # [-1, 1]
+
+    pts  = np.stack([x, y, z, p_norm, v_norm], axis=1)
+    pc   = pc_range
+    mask = (
+        (pts[:, 0] >= pc[0]) & (pts[:, 0] < pc[3]) &
+        (pts[:, 1] >= pc[1]) & (pts[:, 1] < pc[4]) &
+        (pts[:, 2] >= pc[2]) & (pts[:, 2] < pc[5])
+    )
+    return pts[mask]
+
+
+def _process_lidar(
+    raw:      np.ndarray,
+    pc_range: List[float],
+    ransac_cfg: Optional[dict] = None,
+) -> np.ndarray:
+    """
+    Process raw [M, 3] LiDAR XYZ:
+      1. RANSAC ground removal.
+      2. Crop to point_cloud_range.
+      3. Pad intensity = 1.0.
+    Returns [M', 4] float32.
+    """
+    if raw.ndim == 1:
+        raw = raw.reshape(-1, 3)
+    pts = raw[:, :3].astype(np.float32)
+
+    if pts.shape[0] == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    # Ground removal
+    cfg = ransac_cfg or {}
+    pts = _ransac_ground_removal(pts, **cfg)
+
+    if pts.shape[0] == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    # Range crop
+    pc   = pc_range
+    mask = (
+        (pts[:, 0] >= pc[0]) & (pts[:, 0] < pc[3]) &
+        (pts[:, 1] >= pc[1]) & (pts[:, 1] < pc[4]) &
+        (pts[:, 2] >= pc[2]) & (pts[:, 2] < pc[5])
+    )
+    pts = pts[mask]
+    if pts.shape[0] == 0:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    out = np.zeros((pts.shape[0], 4), dtype=np.float32)
+    out[:, :3] = pts
+    out[:,  3] = 1.0
     return out
 
 
-class VoDDataset(Dataset):
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class RADIalDataset(Dataset):
     """
-    Layout atteso (MSDNet):
-        root/lidar/*.bin (N,4) float32, root/radar/*.bin (N,5), root/split/*.txt
+    RADIal dataset for MSDNet teacher and student training.
 
-    **Pipeline LiDAR in ``__getitem__`` (ordine fisso):**
-        1. ``remove_ground_elevation_map`` — rimozione suolo (mappa di elevazione)
-        2. ``_crop_to_fov`` — FoV orizzontale radar
-        3. ``_crop_to_range`` — ``point_cloud_range``
-        4. ``_generate_gt`` — voxel GT allineati al decoder
+    Reads from the `radar_lidar_pc_dataset/` folder structure.
 
-    Anteprima **senza** questi passi: ``python vod_pipeline.py preview ...``.
-    Schema testuale: ``python vod_pipeline.py pipeline``.
+    Ground-removed LiDAR is cached in `<root>/laser_PCL_ng/` and reused
+    on every subsequent epoch (RANSAC is run only once per frame).
+
+    Args:
+        root_dir:    Path to `radar_lidar_pc_dataset/`.
+        sample_ids:  List of integer sample_ids (from get_splits()).
+        cfg:         MSDNetConfig instance.
+        ransac_cfg:  Optional dict of kwargs forwarded to
+                     _ransac_ground_removal().  Defaults:
+                       n_iters=100, dist_thresh=0.20,
+                       candidate_percentile=20.0, above_margin=0.10
+
+    Each sample returns:
+        lidar:     (M, 4)  float32  [x, y, z, intensity=1]
+        radar:     (N, 5)  float32  [x, y, z, power_norm, v_norm]
+        gt_occ:    {4, 2, 1 → (1, Z_s, Y_s, X_s)}
+        gt_offset: {4, 2, 1 → (3, Z_s, Y_s, X_s)}
+        frame_id:  str
     """
 
-    def __init__(self, root: str, split: str = "train",
-                 point_cloud_range=None,
-                 voxel_size=None,
-                 ground_height: float = -1.5,
-                 radar_fov_deg: float = 120.0,
-                 verify_files: bool = True,
-                 vod_sequence_filter: Optional[str] = None):
-        super().__init__()
-        self.root = root
-        self.ground_height = ground_height
-        self.radar_fov_deg = radar_fov_deg
-        self.point_cloud_range = point_cloud_range or [0, -16, -2, 32, 16, 4]
-        self.voxel_size = voxel_size or [0.1, 0.1, 0.15]
-        self.vod_sequence_filter = vod_sequence_filter
+    def __init__(
+        self,
+        root_dir:   str | Path,
+        sample_ids: List[int],
+        cfg,
+        ransac_cfg: Optional[dict] = None,
+    ) -> None:
+        self.root       = Path(root_dir)
+        self.sample_ids = sample_ids
+        self.cfg        = cfg
+        self.pc_range   = cfg.voxel.point_cloud_range
+        self.ransac_cfg = ransac_cfg or {}
 
-        split_file = os.path.join(root, "split", f"{split}.txt")
-        with open(split_file, "r") as f:
-            all_frame_ids = [line.strip() for line in f if line.strip()]
+        # Processed LiDAR lives here — auto-created on first run
+        self.lidar_ng_dir = self.root / "laser_PCL_ng"
+        self.lidar_ng_dir.mkdir(exist_ok=True)
 
-        if vod_sequence_filter == "4drvo_net":
-            n0 = len(all_frame_ids)
-            all_frame_ids = _filter_frame_ids_4drvo_net(all_frame_ids, split)
-            print(
-                f"Dataset 4drvo_net split={split!r}: {n0} -> {len(all_frame_ids)} frames"
-            )
-        elif vod_sequence_filter not in (None, ""):
-            raise ValueError(
-                f"Unknown vod_sequence_filter={vod_sequence_filter!r}; "
-                "use None or '4drvo_net'"
-            )
+        # Pre-compute GT volume shapes for this config
+        gx, gy, gz   = cfg.grid_size      # (X_cells, Y_cells, Z_cells)
+        bev_h = gy // 8                   # H_bev = Y//8  (row, lateral)
+        bev_w = gx // 8                   # W_bev = X//8  (col, forward)
+        self._vol_shapes = _gt_volume_shapes(bev_h, bev_w, gz)
 
-        # Verify file existence if requested (quiet mode)
-        if verify_files:
-            valid_frame_ids = []
-            missing_count = 0
-            
-            for fid in all_frame_ids:
-                lidar_path = os.path.join(root, "lidar", f"{fid}.bin")
-                radar_path = os.path.join(root, "radar", f"{fid}.bin")
-                
-                if os.path.exists(lidar_path) and os.path.exists(radar_path):
-                    valid_frame_ids.append(fid)
-                else:
-                    missing_count += 1
-            
-            self.frame_ids = valid_frame_ids
-            if missing_count > 0:
-                print(f"Dataset: {len(self.frame_ids)} valid pairs ({missing_count} missing files)")
-        else:
-            self.frame_ids = all_frame_ids
+    # ------------------------------------------------------------------
 
-    def __len__(self):
-        return len(self.frame_ids)
+    def __len__(self) -> int:
+        return len(self.sample_ids)
 
-    def __getitem__(self, idx):
-        fid = self.frame_ids[idx]
-
-        lidar_path = os.path.join(self.root, "lidar", f"{fid}.bin")
-        radar_path = os.path.join(self.root, "radar", f"{fid}.bin")
-        
-        # Check if files exist
-        if not os.path.exists(lidar_path):
-            raise FileNotFoundError(f"LiDAR file not found: {lidar_path}")
-        if not os.path.exists(radar_path):
-            raise FileNotFoundError(f"Radar file not found: {radar_path}")
-
-        lidar = np.fromfile(lidar_path, dtype=np.float32).reshape(-1, 4)
-        radar = np.fromfile(radar_path, dtype=np.float32).reshape(-1, 5)
-
-        lidar = self._preprocess_lidar(lidar)
-        # No preprocessing for radar (paper doesn't mention any)
-
-        lidar_t = torch.from_numpy(lidar).float()
-        radar_t = torch.from_numpy(radar).float()
-
-        gt_occ, gt_offset = self._generate_gt(lidar)
+    def __getitem__(self, index: int) -> dict:
+        sid    = self.sample_ids[index]
+        radar  = self._load_radar(sid)
+        lidar  = self._load_lidar(sid)
+        gt_occ, gt_off = _generate_gt(lidar, self.pc_range, self._vol_shapes)
 
         return {
-            "lidar": lidar_t,
-            "radar": radar_t,
-            "gt_occ": gt_occ,
-            "gt_offset": gt_offset,
-            "frame_id": fid,
+            "lidar":     torch.from_numpy(lidar).float(),
+            "radar":     torch.from_numpy(radar).float(),
+            "gt_occ":    gt_occ,
+            "gt_offset": gt_off,
+            "frame_id":  f"radial_{sid:06d}",
         }
 
-    # ---- preprocessing ----
+    # ── radar ──────────────────────────────────────────────────────────
 
-    def _preprocess_lidar(self, pc: np.ndarray) -> np.ndarray:
-        """Remove ground points and crop to radar FoV (following paper Section IV-B)."""
-        if pc.shape[0] == 0:
-            return pc
-            
-        # Paper method 1: "removing ground points from the LiDAR data"  
-        # Use elevation map method (standard in autonomous driving)
-        pc = self._ground_removal_elevation_map(pc, grid_size=0.5, height_threshold=0.3)
-        
-        # Paper method 2: "cropping the LiDAR point cloud to match the Field of View (FOV) of the 4D radar"
-        pc = self._crop_to_fov(pc)
-        
-        # Apply point cloud range cropping (this happens in voxelizer too)
-        pc = self._crop_to_range(pc)
-        return pc
+    def _load_radar(self, sid: int) -> np.ndarray:
+        path = self.root / "radar_PCL" / f"pcl_{sid:06d}.npy"
+        if not path.exists():
+            return np.zeros((0, 5), dtype=np.float32)
+        raw = np.load(path, allow_pickle=True)   # (9, N)
+        return _process_radar(raw, self.pc_range)
 
-    def _crop_to_fov(self, pc: np.ndarray) -> np.ndarray:
-        """Keep points within the radar's horizontal field of view."""
-        half_fov = np.deg2rad(self.radar_fov_deg / 2)
-        angles = np.arctan2(pc[:, 1], pc[:, 0])
-        mask = np.abs(angles) <= half_fov
-        return pc[mask]
+    # ── LiDAR ──────────────────────────────────────────────────────────
 
-    def _crop_to_range(self, pc: np.ndarray) -> np.ndarray:
-        pc_range = self.point_cloud_range
-        mask = (
-            (pc[:, 0] >= pc_range[0]) & (pc[:, 0] < pc_range[3]) &
-            (pc[:, 1] >= pc_range[1]) & (pc[:, 1] < pc_range[4]) &
-            (pc[:, 2] >= pc_range[2]) & (pc[:, 2] < pc_range[5])
-        )
-        return pc[mask]
+    def _load_lidar(self, sid: int) -> np.ndarray:
+        cache_f = self.lidar_ng_dir / f"pcl_{sid:06d}.npy"
 
-    # ---- ground-truth voxel targets (multi-scale) ----
+        # 1. Return cached ground-removed result if available
+        if cache_f.exists():
+            return np.load(cache_f)
 
-    def _generate_gt(self, lidar: np.ndarray):
-        """
-        Occupancy e offset alle stesse dimensioni (Z,Y,X) di ``PointCloudReconstruction``.
+        # 2. Load raw LiDAR, apply RANSAC + crop + pad
+        raw_path = self.root / "laser_PCL" / f"pcl_{sid:06d}.npy"
+        if not raw_path.exists():
+            return np.zeros((0, 4), dtype=np.float32)
 
-        I passi metrici per scala ricoprono l'intero ``point_cloud_range`` (nessun 16 m
-        artificiale su 32 m): ``vx = extent_x / n_x`` con ``n_x`` = larghezza tensor X, ecc.
-        """
-        gx, gy, gz = _grid_dims_from_range(self.point_cloud_range, self.voxel_size)
-        bev_h, bev_w = gx // 8, gy // 8
-        volumes = decoder_volume_zyx(bev_h, bev_w, gz)
+        raw       = np.load(raw_path, allow_pickle=True)   # (M, 3)
+        processed = _process_lidar(raw, self.pc_range, self.ransac_cfg)
 
-        gt_occ, gt_offset = {}, {}
-        pc_range = self.point_cloud_range
-
-        for scale in (4, 2, 1):
-            nz, ny, nx = volumes[scale]
-            vx, vy, vz, pc_min = _world_steps_xyz(nz, ny, nx, pc_range)
-
-            occ = np.zeros((1, nz, ny, nx), dtype=np.float32)
-            offset = np.zeros((3, nz, ny, nx), dtype=np.float32)
-
-            if lidar.shape[0] == 0:
-                gt_occ[scale] = torch.from_numpy(occ)
-                gt_offset[scale] = torch.from_numpy(offset)
-                continue
-
-            ix = np.floor((lidar[:, 0] - pc_min[0]) / vx).astype(np.int64)
-            iy = np.floor((lidar[:, 1] - pc_min[1]) / vy).astype(np.int64)
-            iz = np.floor((lidar[:, 2] - pc_min[2]) / vz).astype(np.int64)
-            ix = np.clip(ix, 0, nx - 1)
-            iy = np.clip(iy, 0, ny - 1)
-            iz = np.clip(iz, 0, nz - 1)
-
-            for i in range(lidar.shape[0]):
-                xi, yi, zi = int(ix[i]), int(iy[i]), int(iz[i])
-                occ[0, zi, yi, xi] = 1.0
-                c0 = float(pc_min[0] + (xi + 0.5) * vx)
-                c1 = float(pc_min[1] + (yi + 0.5) * vy)
-                c2 = float(pc_min[2] + (zi + 0.5) * vz)
-                center = np.array([c0, c1, c2], dtype=np.float32)
-                offset[:, zi, yi, xi] = lidar[i, :3].astype(np.float32) - center
-
-            gt_occ[scale] = torch.from_numpy(occ)
-            gt_offset[scale] = torch.from_numpy(offset)
-
-        return gt_occ, gt_offset
-
-    def _ground_removal_elevation_map(self, points, grid_size=0.5, height_threshold=0.3):
-        """Delega a :func:`remove_ground_elevation_map` con ``ground_height`` del dataset."""
-        return remove_ground_elevation_map(
-            points,
-            ground_height=self.ground_height,
-            grid_size=grid_size,
-            height_threshold=height_threshold,
-        )
+        # 3. Save to laser_PCL_ng/ for all future epochs
+        np.save(cache_f, processed)
+        return processed
 
 
-def collate_fn(batch):
-    """Custom collation: point clouds stay as lists, GT tensors are stacked."""
-    lidar_list = [b["lidar"] for b in batch]
-    radar_list = [b["radar"] for b in batch]
-    frame_ids = [b["frame_id"] for b in batch]
+# ---------------------------------------------------------------------------
+# Collate function
+# ---------------------------------------------------------------------------
 
-    gt_occ = {}
-    gt_offset = {}
-    for s in [4, 2, 1]:
-        gt_occ[s] = torch.stack([b["gt_occ"][s] for b in batch])
-        gt_offset[s] = torch.stack([b["gt_offset"][s] for b in batch])
-
+def collate_fn(batch: list) -> dict:
+    """Custom collation: point clouds as lists, GT tensors stacked."""
     return {
-        "lidar": lidar_list,
-        "radar": radar_list,
-        "gt_occ": gt_occ,
-        "gt_offset": gt_offset,
-        "frame_ids": frame_ids,
+        "lidar":     [b["lidar"]    for b in batch],
+        "radar":     [b["radar"]    for b in batch],
+        "gt_occ":    {s: torch.stack([b["gt_occ"][s]    for b in batch]) for s in [4, 2, 1]},
+        "gt_offset": {s: torch.stack([b["gt_offset"][s] for b in batch]) for s in [4, 2, 1]},
+        "frame_ids": [b["frame_id"] for b in batch],
     }
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _check_columns(df: pd.DataFrame, required: List[str]) -> None:
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"index.csv is missing expected columns: {missing}.\n"
+            f"Available columns: {list(df.columns)}\n"
+            "Make sure the dataset was built with build_radial_dataset.py."
+        )

@@ -1,7 +1,16 @@
 """VoxelNet-style encoder: Voxelization → VFE → Sparse 3D backbone → BEV.
 
-Uses spconv for sparse 3D convolutions (Zhou & Tuzel, CVPR 2018).
+Also provides DopplerBEVMap: converts the radar velocity channel into a
+structured (B, D, H_bev, W_bev) feature map for downstream conditioning.
+
+Changes vs original:
+  - Voxelizer inner loop fully vectorised (O(N log N) sort + O(N) scatter)
+    instead of the previous O(N_voxels × N_points) Python loop.
+  - DopplerBEVMap added (new).
 """
+
+import math
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -15,292 +24,340 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Voxelization (pure-PyTorch fallback; production code may use spconv utils)
+# Doppler BEV map
+# ---------------------------------------------------------------------------
+
+class DopplerBEVMap(nn.Module):
+    """
+    Converts a batch of 4D radar point clouds into a structured BEV Doppler
+    feature map for conditioning RGFD and DGFD.
+
+    Physics motivation:
+      - Radial velocity encodes whether a detection is a moving target or
+        static clutter (ego-motion compensated or not).
+      - Injecting this signal helps the reconstruction U-Net focus on moving
+        objects and helps the diffusion noise adapter set the right noise level
+        for dynamic vs static regions.
+
+    Pipeline:
+      radar PC (N, 5: x,y,z,intensity,velocity)
+        → scatter velocity stats to BEV grid → (3, H, W) raw map
+            ch0: mean radial velocity (normalised to [-1, 1])
+            ch1: velocity variance   (normalised)
+            ch2: log(1 + point_count) per cell (density proxy)
+        → small CNN → (D, H, W)
+
+    Output: (B, D, H_bev, W_bev)
+    """
+
+    def __init__(
+        self,
+        pc_range: List[float],
+        bev_size:  tuple,         # (H_bev, W_bev) matching encoder BEV output
+        out_channels: int = 32,
+        v_max: float = 1.0,       # normalisation constant for the velocity channel
+                                  # dataset.py stores v_bin_centered/128 → already [-1,1]
+                                  # so v_max=1.0 is correct
+    ) -> None:
+        super().__init__()
+        self.pc_range    = pc_range
+        self.bev_size    = bev_size   # (H, W) = (Y_dim, X_dim)
+        self.v_max       = v_max
+
+        # Normalisation constants (precomputed, no learnable params)
+        log_count_max = math.log1p(50.0)   # typical max pts per BEV cell
+        self.register_buffer("log_count_norm", torch.tensor(log_count_max))
+
+        # Small 2-layer CNN to encode the 3 raw channels
+        D = out_channels
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, D, 3, padding=1, bias=False),
+            nn.BatchNorm2d(D),
+            nn.GELU(),
+            nn.Conv2d(D, D, 3, padding=1, bias=False),
+            nn.BatchNorm2d(D),
+            nn.GELU(),
+        )
+
+    def _scatter_to_bev(self, pts: torch.Tensor) -> torch.Tensor:
+        """
+        Scatter velocity statistics from (N, 5) radar PC to (3, H, W) BEV map.
+
+        Fully vectorised with scatter_add — O(N) complexity.
+        """
+        H, W   = self.bev_size
+        device = pts.device
+
+        if pts.shape[0] == 0:
+            return torch.zeros(3, H, W, device=device)
+
+        xmin, ymin = self.pc_range[0], self.pc_range[1]
+        xmax, ymax = self.pc_range[3], self.pc_range[4]
+
+        # X → column (W dimension), Y → row (H dimension)
+        col = ((pts[:, 0] - xmin) / (xmax - xmin) * W).long().clamp(0, W - 1)
+        row = ((pts[:, 1] - ymin) / (ymax - ymin) * H).long().clamp(0, H - 1)
+
+        idx = row * W + col   # linear index, (N,)
+        N   = H * W
+        vel = pts[:, 4]
+
+        ones = torch.ones(pts.shape[0], device=device)
+        vel_sum    = torch.zeros(N, device=device).scatter_add(0, idx, vel)
+        vel_sq_sum = torch.zeros(N, device=device).scatter_add(0, idx, vel * vel)
+        count      = torch.zeros(N, device=device).scatter_add(0, idx, ones)
+
+        count_safe = count.clamp(min=1.0)
+        mean_vel   = vel_sum / count_safe
+        var_vel    = (vel_sq_sum / count_safe - mean_vel ** 2).clamp(min=0.0)
+        log_count  = torch.log1p(count)
+
+        raw = torch.stack([
+            mean_vel  / (self.v_max + 1e-8),            # ch0: normalised mean vel
+            var_vel   / (self.v_max ** 2 + 1e-8),       # ch1: normalised variance
+            log_count / (self.log_count_norm + 1e-8),   # ch2: density proxy
+        ], dim=0).reshape(3, H, W)
+
+        return raw
+
+    def forward(self, radar_list: list) -> torch.Tensor:
+        """
+        Args:
+            radar_list: list of B × (N_i, 5) radar PC tensors
+        Returns:
+            (B, out_channels, H_bev, W_bev)
+        """
+        raw_maps = [self._scatter_to_bev(pts) for pts in radar_list]
+        raw = torch.stack(raw_maps, dim=0)    # (B, 3, H, W)
+        return self.encoder(raw)              # (B, D, H, W)
+
+
+# ---------------------------------------------------------------------------
+# Voxelization  (vectorised)
 # ---------------------------------------------------------------------------
 
 class Voxelizer(nn.Module):
-    """Hard voxelization: assigns each point to a voxel by its (x,y,z) index."""
+    """
+    Hard voxelization: assigns each point to a voxel, then packs up to
+    max_points_per_voxel points per voxel.
+
+    Fully vectorised — avoids the O(N_voxels × N_points) Python loop of the
+    original by sorting once and using scatter_add for all aggregations.
+    """
 
     def __init__(self, voxel_size, point_cloud_range,
-                 max_points_per_voxel=5, max_voxels_train=40000, max_voxels_eval=60000):
+                 max_points_per_voxel=5,
+                 max_voxels_train=40_000, max_voxels_eval=60_000):
         super().__init__()
-        self.voxel_size = torch.tensor(voxel_size, dtype=torch.float32)
-        self.pc_range_min = torch.tensor(point_cloud_range[:3], dtype=torch.float32)
-        self.pc_range_max = torch.tensor(point_cloud_range[3:], dtype=torch.float32)
-        self.max_points = max_points_per_voxel
-        self.max_voxels_train = max_voxels_train
-        self.max_voxels_eval = max_voxels_eval
+        self.max_pts          = max_points_per_voxel
+        self.max_vox_train    = max_voxels_train
+        self.max_vox_eval     = max_voxels_eval
 
-        grid = ((self.pc_range_max - self.pc_range_min) / self.voxel_size).long()
-        self.register_buffer("grid_size", grid)
+        vs  = torch.tensor(voxel_size, dtype=torch.float32)
+        pcm = torch.tensor(point_cloud_range[:3], dtype=torch.float32)
+        pcx = torch.tensor(point_cloud_range[3:], dtype=torch.float32)
+        gs  = ((pcx - pcm) / vs).long()
+
+        self.register_buffer("voxel_size",   vs)
+        self.register_buffer("pc_range_min", pcm)
+        self.register_buffer("pc_range_max", pcx)
+        self.register_buffer("grid_size",    gs)
 
     @torch.no_grad()
     def forward(self, points_list: list):
         """
-        Args:
-            points_list: list of (N_i, F) tensors, one per sample.
-
         Returns:
-            voxel_features: (total_voxels, max_points, F)
-            voxel_coords:   (total_voxels, 4)  batch_idx, z, y, x
-            num_points:     (total_voxels,)
+            voxel_features: (V_total, max_pts, F)
+            voxel_coords:   (V_total, 4)  [batch, z, y, x]
+            num_points:     (V_total,)
         """
-        # Use appropriate max_voxels based on training mode
-        max_voxels = self.max_voxels_train if self.training else self.max_voxels_eval
-        
+        max_vox = self.max_vox_train if self.training else self.max_vox_eval
         all_feats, all_coords, all_npts = [], [], []
-        for batch_idx, points in enumerate(points_list):
-            device = points.device
-            vs = self.voxel_size.to(device)
-            pc_min = self.pc_range_min.to(device)
-            pc_max = self.pc_range_max.to(device)
 
-            # Filter points to point cloud range
-            mask = ((points[:, :3] >= pc_min) & (points[:, :3] < pc_max)).all(dim=1)
-            points = points[mask]
-            
-            if points.shape[0] == 0:
-                # Handle empty point cloud case
-                empty_feats = points.new_zeros(0, self.max_points, points.shape[1])
-                empty_coords = points.new_zeros(0, 4, dtype=torch.long)
-                empty_npts = points.new_zeros(0, dtype=torch.long)
-                all_feats.append(empty_feats)
-                all_coords.append(empty_coords)
-                all_npts.append(empty_npts)
+        for b_idx, points in enumerate(points_list):
+            dev = points.device
+            vs  = self.voxel_size.to(dev)
+            pcm = self.pc_range_min.to(dev)
+            pcx = self.pc_range_max.to(dev)
+            gs  = self.grid_size.to(dev)
+
+            # 1. Filter out-of-range points
+            mask = ((points[:, :3] >= pcm) & (points[:, :3] < pcx)).all(dim=1)
+            pts  = points[mask]
+
+            if pts.shape[0] == 0:
+                F = points.shape[1]
+                all_feats.append(pts.new_zeros(0, self.max_pts, F))
+                all_coords.append(pts.new_zeros(0, 4, dtype=torch.long))
+                all_npts.append(pts.new_zeros(0, dtype=torch.long))
                 continue
 
-            # Compute voxel coordinates
-            coords = ((points[:, :3] - pc_min) / vs).long()
-            gs = self.grid_size.to(device)
-            coords = coords.clamp(min=torch.zeros(3, device=device, dtype=torch.long),
-                                  max=gs - 1)
+            F = pts.shape[1]
 
-            # Linear indexing for unique voxel detection
+            # 2. Compute voxel (x, y, z) indices for each point
+            coords = ((pts[:, :3] - pcm) / vs).long().clamp(
+                min=torch.zeros(3, device=dev, dtype=torch.long),
+                max=gs - 1,
+            )  # (N, 3)  in (X, Y, Z) order
+
+            # 3. Unique voxel detection via linear hash
             linear = coords[:, 0] * (gs[1] * gs[2]) + coords[:, 1] * gs[2] + coords[:, 2]
+            unique_lin, inverse = torch.unique(linear, return_inverse=True)
+            n_uniq = unique_lin.shape[0]
 
-            unique_linear, inverse = torch.unique(linear, return_inverse=True)
-            
-            # Apply voxel limit
-            n_unique_voxels = unique_linear.shape[0]
-            if n_unique_voxels > max_voxels:
+            # 4. Apply voxel budget
+            if n_uniq > max_vox:
                 if self.training:
-                    # Random sampling during training for regularization
-                    perm = torch.randperm(n_unique_voxels, device=device)[:max_voxels]
-                    selected_indices = perm
+                    sel = torch.randperm(n_uniq, device=dev)[:max_vox]
                 else:
-                    # Deterministic selection during evaluation (take first max_voxels)
-                    selected_indices = torch.arange(max_voxels, device=device)
-                
-                # Keep only points belonging to selected voxels
-                keep_mask = torch.zeros(len(inverse), dtype=torch.bool, device=device)
-                for i in selected_indices:
-                    keep_mask |= (inverse == i)
-                
-                points = points[keep_mask]
-                coords = coords[keep_mask]
-                inverse = inverse[keep_mask]
-                
-                # Remap inverse to 0-based consecutive indices
+                    sel = torch.arange(max_vox, device=dev)
+
+                keep_set = torch.zeros(n_uniq, dtype=torch.bool, device=dev)
+                keep_set[sel] = True
+                keep_pts = keep_set[inverse]
+
+                pts     = pts[keep_pts]
+                coords  = coords[keep_pts]
+                inverse = inverse[keep_pts]
+
+                # Remap inverse to 0-based consecutive
                 unique_old = torch.unique(inverse)
-                remap = torch.zeros(n_unique_voxels, dtype=torch.long, device=device)
-                remap[unique_old] = torch.arange(len(unique_old), device=device)
+                remap = torch.zeros(n_uniq, dtype=torch.long, device=dev)
+                remap[unique_old] = torch.arange(len(unique_old), device=dev)
                 inverse = remap[inverse]
-                
                 n_voxels = len(unique_old)
             else:
-                n_voxels = n_unique_voxels
+                n_voxels = n_uniq
 
-            num_features = points.shape[1]
-            voxel_feats = points.new_zeros(n_voxels, self.max_points, num_features)
-            voxel_npts = points.new_zeros(n_voxels, dtype=torch.long)
-            voxel_coords = points.new_zeros(n_voxels, 3, dtype=torch.long)
+            # 5. Vectorised fill: sort by voxel, then assign points to slots
+            order = inverse.argsort()            # sort points by voxel index
+            sorted_pts = pts[order]              # (N, F)
+            sorted_inv = inverse[order]          # (N,)
+            sorted_coo = coords[order]           # (N, 3)
 
-            # Aggregate points into voxels
-            for i in range(n_voxels):
-                pt_mask = inverse == i
-                if pt_mask.sum() == 0:
-                    continue
-                pts = points[pt_mask]
-                num_pts_in_voxel = min(pts.shape[0], self.max_points)
-                
-                # Random sampling of points within voxel during training
-                if self.training and pts.shape[0] > self.max_points:
-                    perm = torch.randperm(pts.shape[0], device=device)[:self.max_points]
-                    pts = pts[perm]
-                    num_pts_in_voxel = self.max_points
-                
-                voxel_feats[i, :num_pts_in_voxel] = pts[:num_pts_in_voxel]
-                voxel_npts[i] = num_pts_in_voxel
-                voxel_coords[i] = coords[pt_mask][0]
+            # within-voxel slot index for each (sorted) point
+            vox_starts = torch.searchsorted(
+                sorted_inv.contiguous(),
+                torch.arange(n_voxels, device=dev),
+            )  # (n_voxels,)  first index per voxel in sorted array
 
-            batch_col = torch.full((n_voxels, 1), batch_idx,
-                                   dtype=torch.long, device=device)
-            # spconv expects (batch, z, y, x)
-            zyx = voxel_coords[:, [2, 1, 0]]
-            voxel_coords_4d = torch.cat([batch_col, zyx], dim=1)
+            within_idx = (torch.arange(len(sorted_inv), device=dev)
+                          - vox_starts[sorted_inv])  # (N,)
+
+            valid = within_idx < self.max_pts
+            s_pts = sorted_pts[valid]
+            s_inv = sorted_inv[valid]
+            s_coo = sorted_coo[valid]
+            s_wi  = within_idx[valid]
+
+            # 6. Fill output tensors
+            voxel_feats  = pts.new_zeros(n_voxels, self.max_pts, F)
+            voxel_coords = pts.new_zeros(n_voxels, 3, dtype=torch.long)
+            voxel_npts   = pts.new_zeros(n_voxels, dtype=torch.long)
+
+            voxel_feats[s_inv, s_wi] = s_pts
+            # Voxel coordinates from first point per voxel
+            voxel_coords = sorted_coo[vox_starts.clamp(0, len(sorted_coo) - 1)]
+
+            # Count valid points per voxel
+            ones = torch.ones(len(s_inv), dtype=torch.long, device=dev)
+            voxel_npts.scatter_add_(0, s_inv, ones)
+
+            # 7. Build (batch, z, y, x) coords for spconv
+            b_col = voxel_coords.new_full((n_voxels, 1), b_idx)
+            zyx   = voxel_coords[:, [2, 1, 0]]            # X,Y,Z → Z,Y,X
+            voxel_coords_4d = torch.cat([b_col, zyx], dim=1)
 
             all_feats.append(voxel_feats)
             all_coords.append(voxel_coords_4d)
             all_npts.append(voxel_npts)
 
-        return (torch.cat(all_feats, 0),
+        return (torch.cat(all_feats,  0),
                 torch.cat(all_coords, 0),
-                torch.cat(all_npts, 0))
+                torch.cat(all_npts,   0))
 
 
 # ---------------------------------------------------------------------------
-# Voxel Feature Encoding (VFE) – following VoxelNet paper (Zhou & Tuzel)
+# VFE  (paper-faithful, Zhou & Tuzel CVPR 2018)
 # ---------------------------------------------------------------------------
 
 class VFELayer(nn.Module):
-    """Paper-faithful VFE layer following Zhou & Tuzel CVPR 2018 exactly."""
-    
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        # Paper: VFE-i(c_in, c_out) where linear maps c_in -> c_out//2
-        # because concatenation doubles to c_out
-        self.units = out_channels // 2
-        self.linear = nn.Linear(in_channels, self.units, bias=False)
-        self.norm = nn.BatchNorm1d(self.units)
-        self.relu = nn.ReLU(inplace=True)
-        
-    def forward(self, inputs: torch.Tensor, mask: torch.Tensor):
-        """
-        Paper-faithful VFE: FCN per point -> max -> concatenate [point_feat, max_feat]
-        
-        Args:
-            inputs: (V, T, C) voxel features  
-            mask:   (V, T) point validity mask
-        Returns:
-            (V, T, 2*units) concatenated features (paper Eq. before Eq.1)
-        """
-        V, T, C = inputs.shape
-        
-        # Apply FCN to each point: (V*T, C) -> (V*T, units)
-        x = inputs.view(-1, C)
-        x = self.relu(self.norm(self.linear(x)))
-        x = x.view(V, T, self.units)  # (V, T, units)
-        
-        # Zero out invalid points
-        x = x * mask.unsqueeze(-1).float()
-        
-        # Element-wise max over points per voxel
-        x_max, _ = torch.max(x, dim=1, keepdim=True)  # (V, 1, units)
-        x_max = x_max.expand(-1, T, -1)               # (V, T, units)
-        
-        # Concatenate point features with max-pooled features (paper key step!)
-        x_concat = torch.cat([x, x_max], dim=-1)      # (V, T, 2*units)
-        
-        return x_concat
+        self.units   = out_channels // 2
+        self.linear  = nn.Linear(in_channels, self.units, bias=False)
+        self.norm    = nn.BatchNorm1d(self.units)
+        self.relu    = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        V, T, _ = x.shape
+        x_flat = self.relu(self.norm(self.linear(x.view(-1, x.shape[-1]))))
+        x_flat = x_flat.view(V, T, self.units) * mask.unsqueeze(-1).float()
+        x_max, _ = torch.max(x_flat, dim=1, keepdim=True)
+        return torch.cat([x_flat, x_max.expand(-1, T, -1)], dim=-1)
 
 
 class VFE(nn.Module):
-    """Paper-faithful VoxelNet VFE following Zhou & Tuzel exactly."""
-    
     def __init__(self, in_features: int, out_channels: int):
         super().__init__()
-        # Paper config uses 7-D point features for LiDAR:
-        #   [x, y, z, intensity] + [x-vx, y-vy, z-vz] = 4 + 3 = 7
-        # In our code we generalize to any in_features:
-        #   [all input features] + [centroid offsets for xyz] = in_features + 3
-        #
-        # For radar (x,y,z,intensity,velocity): 5 + 3 = 8
-        augmented_in = in_features + 3
-
-        self.vfe1 = VFELayer(augmented_in, 32)  # First VFE: augmented_in -> 16, concat -> 32
-        self.vfe2 = VFELayer(32, 64)       # Second VFE: 32->32, concat->64
-        
-        # Final FCN + max pooling (no concatenation)
+        aug_in = in_features + 3   # original features + centroid offsets (xyz)
+        self.vfe1 = VFELayer(aug_in, 32)
+        self.vfe2 = VFELayer(32, 64)
         self.final_linear = nn.Linear(64, out_channels, bias=False)
-        self.final_norm = nn.BatchNorm1d(out_channels)
-        self.final_relu = nn.ReLU(inplace=True)
-        
-    def forward(self, voxel_features, num_points):
-        """
-        Paper-faithful forward with centroid-offset augmentation and concatenation.
-        
-        Args:
-            voxel_features: (V, max_pts, F) e.g. LiDAR F=4, radar F=5
-            num_points:     (V,) number of valid points per voxel
-        Returns:
-            (V, out_channels) voxel-wise features
-        """
+        self.final_norm   = nn.BatchNorm1d(out_channels)
+        self.final_relu   = nn.ReLU(inplace=True)
+
+    def forward(self, voxel_features: torch.Tensor,
+                num_points: torch.Tensor) -> torch.Tensor:
         V, T, _ = voxel_features.shape
-        
-        # Paper step 1: Compute voxel centroids
-        mask = torch.arange(T, device=voxel_features.device).unsqueeze(0) < num_points.unsqueeze(1)
-        
-        # Compute centroids for each voxel
-        masked_features = voxel_features * mask.unsqueeze(-1).float()
-        centroids = masked_features.sum(dim=1) / num_points.clamp(min=1).unsqueeze(-1).float()  # (V, F)
-        
-        # Paper step 2: Augment points with centroid offsets (7-D input)
-        centroids_expanded = centroids.unsqueeze(1).expand(-1, T, -1)  # (V, T, F)
-        centroid_offsets = voxel_features[:, :, :3] - centroids_expanded[:, :, :3]  # (V, T, 3)
-        
-        # Create augmented input: [all features] + [xyz centroid offsets]
-        inputs_aug = torch.cat(
-            [voxel_features, centroid_offsets], dim=-1
-        )  # (V, T, F+3)
-        
-        # Paper VFE layers with concatenation
-        x = self.vfe1(inputs_aug, mask)    # (V, T, 32)
-        x = self.vfe2(x, mask)            # (V, T, 64)
-        
-        # Final aggregation (max pooling, no concatenation)
+        mask = (torch.arange(T, device=voxel_features.device).unsqueeze(0)
+                < num_points.unsqueeze(1))
+
+        masked = voxel_features * mask.unsqueeze(-1).float()
+        centroids = masked.sum(dim=1) / num_points.clamp(min=1).float().unsqueeze(-1)
+        offsets   = voxel_features[:, :, :3] - centroids.unsqueeze(1).expand(-1, T, -1)[:, :, :3]
+        aug       = torch.cat([voxel_features, offsets], dim=-1)
+
+        x = self.vfe1(aug, mask)
+        x = self.vfe2(x, mask)
         x = x * mask.unsqueeze(-1).float()
-        x_final, _ = torch.max(x, dim=1)  # (V, 64)
-        
-        # Final FCN
-        x_out = self.final_relu(self.final_norm(self.final_linear(x_final)))
-        return x_out
+        x_max, _ = torch.max(x, dim=1)
+        return self.final_relu(self.final_norm(self.final_linear(x_max)))
 
 
 # ---------------------------------------------------------------------------
-# Sparse 3D Convolutional Backbone (SparseEnc)
+# Sparse 3D backbone
 # ---------------------------------------------------------------------------
 
 def _sparse_block(in_ch, out_ch, stride=1):
-    """One sparse-conv block: SparseConv/SubMConv → BN → ReLU → SubMConv → BN → ReLU."""
     assert HAS_SPCONV, "spconv is required for the sparse encoder"
     if stride > 1:
-        downsample = spconv.SparseConv3d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        down = spconv.SparseConv3d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
     else:
-        downsample = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=False)
-
+        down = spconv.SubMConv3d(in_ch, out_ch, 3, padding=1, bias=False)
     return spconv.SparseSequential(
-        downsample,
-        nn.BatchNorm1d(out_ch),
-        nn.ReLU(inplace=True),
+        down,
+        nn.BatchNorm1d(out_ch), nn.ReLU(inplace=True),
         spconv.SubMConv3d(out_ch, out_ch, 3, padding=1, bias=False),
-        nn.BatchNorm1d(out_ch),
-        nn.ReLU(inplace=True),
+        nn.BatchNorm1d(out_ch), nn.ReLU(inplace=True),
     )
 
 
 class SparseEncoder(nn.Module):
-    """
-    4-block sparse 3D backbone with progressive spatial downsampling.
+    """4-block sparse 3D backbone: strides [1, 2, 2, 2] → 8× downsampling."""
 
-    Strides: block1=1 (no downsampling), blocks 2-4 = stride 2.
-    After blocks 2-4, the spatial resolution is divided by 2 each time:
-        (X, Y, Z) → (X, Y, Z) → (X/2, Y/2, Z/2) → (X/4, Y/4, Z/4) → (X/8, Y/8, Z/8)
-    """
-
-    def __init__(self, in_channels: int, channels=(16, 32, 64, 128),
+    def __init__(self, in_channels: int, channels=(64, 32, 64, 128),
                  sparse_shape=None):
         super().__init__()
-        assert HAS_SPCONV, "spconv is required"
-        self.sparse_shape = sparse_shape  # (Z, Y, X) order for spconv
+        assert HAS_SPCONV
+        self.sparse_shape = sparse_shape
+        self.block1 = _sparse_block(in_channels,  channels[0], stride=1)
+        self.block2 = _sparse_block(channels[0],  channels[1], stride=2)
+        self.block3 = _sparse_block(channels[1],  channels[2], stride=2)
+        self.block4 = _sparse_block(channels[2],  channels[3], stride=2)
 
-        self.block1 = _sparse_block(in_channels, channels[0], stride=1)
-        self.block2 = _sparse_block(channels[0], channels[1], stride=2)
-        self.block3 = _sparse_block(channels[1], channels[2], stride=2)
-        self.block4 = _sparse_block(channels[2], channels[3], stride=2)
-
-    def forward(self, voxel_features, voxel_coords, batch_size):
-        x = spconv.SparseConvTensor(voxel_features, voxel_coords.int(),
-                                    self.sparse_shape, batch_size)
+    def forward(self, vf, vc, batch_size):
+        x = spconv.SparseConvTensor(vf, vc.int(), self.sparse_shape, batch_size)
         x = self.block1(x)
         x = self.block2(x)
         x = self.block3(x)
@@ -309,12 +366,10 @@ class SparseEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Height aggregation → BEV features
+# Height compression → BEV
 # ---------------------------------------------------------------------------
 
 class HeightCompression(nn.Module):
-    """Collapse the sparse 3D features along Z to produce a dense BEV map."""
-
     def __init__(self, in_channels: int, z_dim: int, bev_channels: int):
         super().__init__()
         self.conv = nn.Sequential(
@@ -324,10 +379,10 @@ class HeightCompression(nn.Module):
         )
 
     def forward(self, sparse_tensor):
-        dense = sparse_tensor.dense()                # (B, C, Z, Y, X)
+        dense = sparse_tensor.dense()            # (B, C, Z, Y, X)
         B, C, Z, Y, X = dense.shape
-        bev = dense.reshape(B, C * Z, Y, X)          # flatten Z into channels
-        return self.conv(bev)                         # (B, bev_channels, Y, X)
+        bev = dense.reshape(B, C * Z, Y, X)      # flatten Z into channels
+        return self.conv(bev)                     # (B, bev_channels, Y, X)
 
 
 # ---------------------------------------------------------------------------
@@ -335,41 +390,39 @@ class HeightCompression(nn.Module):
 # ---------------------------------------------------------------------------
 
 class VoxelEncoder(nn.Module):
-    """Voxelization → VFE → SparseEnc → BEV features  (Eq. 1 in the paper)."""
+    """Voxelization → VFE → SparseEnc → BEV (Eq. 1)."""
 
     def __init__(self, in_features: int, voxel_cfg, encoder_cfg):
         super().__init__()
-        pc_range = voxel_cfg.point_cloud_range
-        voxel_size = voxel_cfg.voxel_size
-        grid_x = int((pc_range[3] - pc_range[0]) / voxel_size[0])
-        grid_y = int((pc_range[4] - pc_range[1]) / voxel_size[1])
-        grid_z = int((pc_range[5] - pc_range[2]) / voxel_size[2])
+        pc  = voxel_cfg.point_cloud_range
+        vs  = voxel_cfg.voxel_size
+        gx  = int((pc[3] - pc[0]) / vs[0])   # X cells (forward)
+        gy  = int((pc[4] - pc[1]) / vs[1])   # Y cells (lateral)
+        gz  = int((pc[5] - pc[2]) / vs[2])   # Z cells (up)
 
         self.voxelizer = Voxelizer(
-            voxel_size, pc_range,
+            vs, pc,
             voxel_cfg.max_points_per_voxel,
             voxel_cfg.max_voxels_train,
-            voxel_cfg.max_voxels_eval
+            voxel_cfg.max_voxels_eval,
         )
-        
-        # Paper-faithful VFE (fixed architecture from paper)
         self.vfe = VFE(in_features, encoder_cfg.vfe_out_channels)
 
-        sparse_shape = [grid_z, grid_y, grid_x]  # spconv uses (Z, Y, X)
-        channels = encoder_cfg.sparse_channels
+        sparse_shape = [gz, gy, gx]           # spconv convention: (Z, Y, X)
         self.sparse_enc = SparseEncoder(
-            encoder_cfg.vfe_out_channels, channels, sparse_shape,
+            encoder_cfg.vfe_out_channels,
+            encoder_cfg.sparse_channels,
+            sparse_shape,
         )
 
-        # After 3 stride-2 blocks the spatial dims are divided by 8 in each axis.
-        z_reduced = grid_z // 8
+        z_reduced = gz // 8
         self.height_compress = HeightCompression(
-            channels[-1], z_reduced, encoder_cfg.bev_channels,
+            encoder_cfg.sparse_channels[-1], z_reduced, encoder_cfg.bev_channels,
         )
 
     def forward(self, points_list: list, batch_size: int):
-        voxel_feats, voxel_coords, num_pts = self.voxelizer(points_list)
-        voxel_feats = self.vfe(voxel_feats, num_pts)
-        sparse_out = self.sparse_enc(voxel_feats, voxel_coords, batch_size)
-        bev = self.height_compress(sparse_out)
-        return bev
+        """Returns (B, bev_channels, H_bev=Y//8, W_bev=X//8)."""
+        vf, vc, npts = self.voxelizer(points_list)
+        vf = self.vfe(vf, npts)
+        sp = self.sparse_enc(vf, vc, batch_size)
+        return self.height_compress(sp)

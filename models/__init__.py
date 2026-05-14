@@ -1,5 +1,5 @@
 from .msdnet import MSDNetTeacher, MSDNetStudent
-from .encoder import VoxelEncoder
+from .encoder import VoxelEncoder, DopplerBEVMap
 from .enhancement import FeatureEnhancement
 from .rgfd import RGFD
 from .dgfd import DGFD
@@ -9,6 +9,7 @@ __all__ = [
     "MSDNetTeacher",
     "MSDNetStudent",
     "VoxelEncoder",
+    "DopplerBEVMap",
     "FeatureEnhancement",
     "RGFD",
     "DGFD",

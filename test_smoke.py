@@ -80,27 +80,31 @@ def recon_gt():
 
 
 @pytest.fixture
-def vod_dir():
-    """Temporary directory with synthetic VoD-format binary data."""
+def radial_dir():
+    """Temporary directory with synthetic RADIal-format npy data."""
     d = tempfile.mkdtemp(prefix="msdnet_smoke_")
-    for sub in ("lidar", "radar", "split"):
-        os.makedirs(os.path.join(d, sub))
+    pc_dir = os.path.join(d, "radar_pc_cache")
+    for sub in ("radar_FFT", "laser_PCL", pc_dir):
+        os.makedirs(os.path.join(d, sub) if sub != pc_dir else sub)
 
     rng = np.random.RandomState(42)
-    for fid in ("000000", "000001"):
-        rng.uniform([0.5, -2, -0.3, 0], [5, 2, 0.3, 1], (200, 4)).astype(
-            np.float32
-        ).tofile(os.path.join(d, "lidar", f"{fid}.bin"))
-        rng.uniform([0.5, -2, -0.3, 0, -5], [5, 2, 0.3, 1, 5], (80, 5)).astype(
-            np.float32
-        ).tofile(os.path.join(d, "radar", f"{fid}.bin"))
+    for sid in (0, 1):
+        fft = (rng.randn(512, 256, 16) + 1j * rng.randn(512, 256, 16)).astype(np.complex64)
+        np.save(os.path.join(d, "radar_FFT", f"fft_{sid:06d}.npy"), fft)
+        lidar = rng.uniform([0.5, -2, -0.3], [5, 2, 0.3], (200, 3)).astype(np.float32)
+        np.save(os.path.join(d, "laser_PCL", f"pcl_{sid:06d}.npy"), lidar)
+        radar_pc = rng.uniform(
+            [0.5, -2, -0.3, 0, -5], [5, 2, 0.3, 1, 5], (80, 5)
+        ).astype(np.float32)
+        np.save(os.path.join(pc_dir, f"radar_{sid:06d}.npy"), radar_pc)
 
-    for sp in ("train", "test"):
-        with open(os.path.join(d, "split", f"{sp}.txt"), "w") as f:
-            f.write("000000\n000001\n")
-
-    yield d
+    # Return (root, cache_dir) tuple
+    yield d, pc_dir
     shutil.rmtree(d)
+
+
+# Keep old name as alias for backward compat within this file
+vod_dir = radial_dir
 
 
 @pytest.fixture
@@ -144,7 +148,7 @@ class TestImports:
         )
 
     def test_dataset(self):
-        from dataset import VoDDataset, collate_fn
+        from dataset import RADIalDataset, collate_fn
 
     def test_metrics(self):
         from evaluate import (
@@ -192,52 +196,29 @@ class TestConfig:
 
 
 class TestDataset:
-    def test_load(self, vod_dir, small_cfg):
-        from dataset import VoDDataset
+    def _make_ds(self, radial_dir, small_cfg):
+        from dataset import RADIalDataset
+        root, pc_dir = radial_dir
+        return RADIalDataset(root, [0, 1], small_cfg, radar_pc_dir=pc_dir)
 
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+    def test_load(self, radial_dir, small_cfg):
+        ds = self._make_ds(radial_dir, small_cfg)
         assert len(ds) == 2
 
-    def test_getitem_keys(self, vod_dir, small_cfg):
-        from dataset import VoDDataset
-
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+    def test_getitem_keys(self, radial_dir, small_cfg):
+        ds = self._make_ds(radial_dir, small_cfg)
         sample = ds[0]
         for key in ("lidar", "radar", "gt_occ", "gt_offset", "frame_id"):
             assert key in sample
 
-    def test_getitem_shapes(self, vod_dir, small_cfg):
-        from dataset import VoDDataset
-
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+    def test_getitem_shapes(self, radial_dir, small_cfg):
+        ds = self._make_ds(radial_dir, small_cfg)
         sample = ds[0]
         assert sample["lidar"].dim() == 2 and sample["lidar"].shape[1] == 4
         assert sample["radar"].dim() == 2 and sample["radar"].shape[1] == 5
 
-    def test_gt_scales(self, vod_dir, small_cfg):
-        from dataset import VoDDataset
-
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+    def test_gt_scales(self, radial_dir, small_cfg):
+        ds = self._make_ds(radial_dir, small_cfg)
         sample = ds[0]
         for scale in (4, 2, 1):
             assert scale in sample["gt_occ"]
@@ -245,15 +226,9 @@ class TestDataset:
             assert sample["gt_occ"][scale].shape[0] == 1
             assert sample["gt_offset"][scale].shape[0] == 3
 
-    def test_collate(self, vod_dir, small_cfg):
-        from dataset import VoDDataset, collate_fn
-
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+    def test_collate(self, radial_dir, small_cfg):
+        from dataset import collate_fn
+        ds = self._make_ds(radial_dir, small_cfg)
         batch = collate_fn([ds[0], ds[1]])
         assert isinstance(batch["lidar"], list) and len(batch["lidar"]) == 2
         assert isinstance(batch["radar"], list) and len(batch["radar"]) == 2
@@ -261,16 +236,11 @@ class TestDataset:
             assert batch["gt_occ"][s].shape[0] == 2
             assert batch["gt_offset"][s].shape[0] == 2
 
-    def test_test_split(self, vod_dir, small_cfg):
-        from dataset import VoDDataset
-
-        ds = VoDDataset(
-            vod_dir,
-            "test",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
-        assert len(ds) == 2
+    def test_get_splits(self, radial_dir, small_cfg):
+        from dataset import get_splits
+        root, _ = radial_dir
+        train, val, test = get_splits(root, train_ratio=0.5, val_ratio=0.25)
+        assert len(train) + len(val) + len(test) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -537,12 +507,12 @@ class TestLosses:
         assert len(grads) > 0
 
     def test_feature_distillation_loss(self, bev, recon_gt):
-        from losses import bev_nonempty_mask_from_lidar_occ, feature_distillation_loss
+        from losses import bev_nonempty_mask, feature_distillation_loss
 
         occ, _ = recon_gt
-        mask = bev_nonempty_mask_from_lidar_occ(occ[1], bev.shape[-2:])
+        mask = bev_nonempty_mask(occ[1], bev.shape[-2:])
         loss = feature_distillation_loss(
-            torch.randn_like(bev), bev, bev_nonempty_mask=mask,
+            torch.randn_like(bev), bev, omega_ne=mask,
         )
         assert loss.dim() == 0 and loss.item() >= 0
 
@@ -768,17 +738,13 @@ class TestTeacherPipeline:
         n_params = sum(p.numel() for p in model.parameters())
         assert n_params > 0
 
-    def test_forward(self, small_cfg, vod_dir):
-        from dataset import VoDDataset, collate_fn
+    def test_forward(self, small_cfg, radial_dir):
+        from dataset import RADIalDataset, collate_fn
         from models.msdnet import MSDNetTeacher
 
+        root, pc_dir = radial_dir
         model = MSDNetTeacher(small_cfg).eval()
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+        ds = RADIalDataset(root, [0, 1], small_cfg, radar_pc_dir=pc_dir)
         batch = collate_fn([ds[0], ds[1]])
         with torch.no_grad():
             f_dense, recon_out = model(batch["lidar"], B)
@@ -787,18 +753,14 @@ class TestTeacherPipeline:
         for s in (4, 2, 1):
             assert f"occ_{s}" in recon_out
 
-    def test_training_step(self, small_cfg, vod_dir):
-        from dataset import VoDDataset, collate_fn
+    def test_training_step(self, small_cfg, radial_dir):
+        from dataset import RADIalDataset, collate_fn
         from losses import TeacherLoss
         from models.msdnet import MSDNetTeacher
 
+        root, pc_dir = radial_dir
         model = MSDNetTeacher(small_cfg).train()
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+        ds = RADIalDataset(root, [0, 1], small_cfg, radar_pc_dir=pc_dir)
         batch = collate_fn([ds[0], ds[1]])
         _, recon_out = model(batch["lidar"], B)
         loss = TeacherLoss()(recon_out, batch["gt_occ"], batch["gt_offset"])
@@ -819,21 +781,17 @@ class TestStudentPipeline:
         n_params = sum(p.numel() for p in model.parameters())
         assert n_params > 0
 
-    def test_forward(self, small_cfg, vod_dir):
-        from dataset import VoDDataset, collate_fn
+    def test_forward(self, small_cfg, radial_dir):
+        from dataset import RADIalDataset, collate_fn
         from models.msdnet import MSDNetStudent, MSDNetTeacher
 
+        root, pc_dir = radial_dir
         teacher = MSDNetTeacher(small_cfg).eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
         student = MSDNetStudent(small_cfg, teacher.reconstruction)
 
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+        ds = RADIalDataset(root, [0, 1], small_cfg, radar_pc_dir=pc_dir)
         batch = collate_fn([ds[0], ds[1]])
         with torch.no_grad():
             f_teacher, _ = teacher(batch["lidar"], B)
@@ -842,28 +800,24 @@ class TestStudentPipeline:
         for key in ("f_recon", "f_denoised", "recon_out", "diff_loss_inputs"):
             assert key in out
 
-    def test_training_step(self, small_cfg, vod_dir):
-        from dataset import VoDDataset, collate_fn
+    def test_training_step(self, small_cfg, radial_dir):
+        from dataset import RADIalDataset, collate_fn
         from losses import StudentLoss
         from models.msdnet import MSDNetStudent, MSDNetTeacher
 
+        root, pc_dir = radial_dir
         teacher = MSDNetTeacher(small_cfg).eval()
         for p in teacher.parameters():
             p.requires_grad_(False)
         student = MSDNetStudent(small_cfg, teacher.reconstruction)
 
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+        ds = RADIalDataset(root, [0, 1], small_cfg, radar_pc_dir=pc_dir)
         batch = collate_fn([ds[0], ds[1]])
         with torch.no_grad():
             f_teacher, _ = teacher(batch["lidar"], B)
 
         out = student(batch["radar"], B, f_teacher=f_teacher, training=True)
-        loss, loss_dict = StudentLoss()(
+        loss, loss_dict = StudentLoss(small_cfg.loss)(
             out, f_teacher, batch["gt_occ"], batch["gt_offset"]
         )
 
@@ -873,17 +827,13 @@ class TestStudentPipeline:
         optimizer.step()
         assert loss.item() >= 0
 
-    def test_inference(self, small_cfg, vod_dir):
-        from dataset import VoDDataset, collate_fn
+    def test_inference(self, small_cfg, radial_dir):
+        from dataset import RADIalDataset, collate_fn
         from models.msdnet import MSDNetStudent
 
+        root, pc_dir = radial_dir
         student = MSDNetStudent(small_cfg).eval()
-        ds = VoDDataset(
-            vod_dir,
-            "train",
-            point_cloud_range=small_cfg.voxel.point_cloud_range,
-            voxel_size=small_cfg.voxel.voxel_size,
-        )
+        ds = RADIalDataset(root, [0, 1], small_cfg, radar_pc_dir=pc_dir)
         batch = collate_fn([ds[0], ds[1]])
         pcs = student.generate_point_cloud(
             batch["radar"],
